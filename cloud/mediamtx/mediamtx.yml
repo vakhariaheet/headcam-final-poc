@@ -1,0 +1,16 @@
+logLevel: info
+logDestinations: [stdout]
+
+# Hat publishes outbound RTMP. The worker reads that path internally over RTSP.
+rtmp: yes
+rtmpAddress: :1935
+rtspAddress: :8554
+
+api: yes
+apiAddress: :9997
+
+# MediaMTX already permits publishing/reading on any undefined path by
+# default; this catch-all is kept explicit for clarity since the POC only
+# ever uses a single path (live/hat) standing in for the hat's RTSP uplink.
+paths:
+  all_others:

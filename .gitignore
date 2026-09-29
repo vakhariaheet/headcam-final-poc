@@ -1,0 +1,57 @@
+# OS
+.DS_Store
+
+# Node (cloud/worker, backend)
+node_modules/
+dist/
+npm-debug.log*
+
+# Flutter (mobile)
+mobile/.dart_tool/
+mobile/.idea/
+mobile/build/
+mobile/ios/Flutter/ephemeral/
+mobile/ios/Pods/
+mobile/ios/.symlinks/
+mobile/android/.gradle/
+mobile/android/local.properties
+mobile/*.iml
+
+# Cloud compositor local run output
+cloud/output/
+
+# Env / secrets
+# Keep templates reviewable; ignore real environment files in every folder.
+.env
+.env.*
+!.env.example
+!.env.*.example
+!.env.sample
+!.env.template
+*.pem
+firmware/**/secrets.h
+
+firmware/amb82_hat_native/src/mmfv2_video_example/cloud_config.h
+
+# Private keys / mobile signing credentials
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+mobile/android/key.properties
+
+# Native firmware build products (keep source, tests, and vendor licenses)
+firmware/**/build/
+firmware/**/CMakeFiles/
+firmware/**/CMakeCache.txt
+firmware/**/*.o
+firmware/**/*.a
+firmware/**/*.elf
+firmware/**/*.axf
+firmware/**/*.bin
+firmware/**/*.map
+
+# Python test caches
+__pycache__/
+*.py[cod]

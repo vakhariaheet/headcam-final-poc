@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>UmpireHat Overlay (Mock)</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 1920px;
+    height: 1080px;
+    background: transparent;
+    font-family: Arial, Helvetica, sans-serif;
+    overflow: hidden;
+  }
+
+  #scoreboard {
+    position: absolute;
+    left: 40px;
+    bottom: 40px;
+    display: flex;
+    align-items: center;
+    background: rgba(10, 20, 40, 0.85);
+    border-radius: 8px;
+    padding: 16px 28px;
+    color: #fff;
+    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
+  }
+
+  .badge {
+    background: #e63946;
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    margin-right: 16px;
+  }
+
+  .teams { font-size: 28px; font-weight: 700; margin-right: 24px; }
+  .score { font-size: 34px; font-weight: 800; color: #ffd23f; margin-right: 24px; }
+  .overs { font-size: 22px; opacity: 0.85; }
+</style>
+</head>
+<body>
+  <div id="scoreboard">
+    <div class="badge">LIVE</div>
+    <div class="teams" id="teams">Team A vs Team B</div>
+    <div class="score" id="score">0/0</div>
+    <div class="overs" id="overs">0.0 ov</div>
+  </div>
+
+  <script>
+    // Standing in for the real CricHeroes overlay render URL (spec §5.1)
+    // until a live match link is available. Swap page.goto() in server.js
+    // for the real overlay_web_url and this mock scoring loop is no longer
+    // needed.
+    const params = new URLSearchParams(window.location.search);
+    document.getElementById('teams').textContent =
+      (params.get('team_a') || 'Team A') + ' vs ' + (params.get('team_b') || 'Team B');
+
+    let runs = parseInt(params.get('runs') || '0', 10);
+    let wickets = parseInt(params.get('wickets') || '0', 10);
+    let completedOvers = 0;
+    let ballsThisOver = 0;
+
+    function render() {
+      document.getElementById('score').textContent = `${runs}/${wickets}`;
+      document.getElementById('overs').textContent = `${completedOvers}.${ballsThisOver} ov`;
+    }
+    render();
+
+    // Ticks the mock score periodically so the capture pipeline is proven
+    // against a changing DOM rather than a static frame.
+    setInterval(() => {
+      runs += Math.floor(Math.random() * 5);
+      ballsThisOver += 1;
+      if (ballsThisOver >= 6) {
+        ballsThisOver = 0;
+        completedOvers += 1;
+      }
+      render();
+    }, 4000);
+  </script>
+</body>
+</html>

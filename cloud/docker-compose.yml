@@ -1,0 +1,57 @@
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: umpirehat-mediamtx
+    ports:
+      - "1935:1935"
+      - "127.0.0.1:8554:8554"
+      - "127.0.0.1:9997:9997"
+    volumes:
+      - ./mediamtx/mediamtx.yml:/mediamtx.yml:ro
+
+  # Stands in for the hat's real RTSP uplink (spec §2.2) until hardware
+  # arrives. Not part of the production topology.
+  simulator:
+    profiles: [simulator]
+    build: ./simulator
+    container_name: umpirehat-simulator
+    depends_on:
+      - mediamtx
+    environment:
+      MEDIAMTX_HOST: mediamtx
+      MEDIAMTX_RTSP_PORT: "8554"
+      STREAM_PATH: live/hat
+    restart: unless-stopped
+
+  worker:
+    build: ./worker
+    container_name: umpirehat-worker
+    depends_on:
+      - mediamtx
+    environment:
+      RTSP_URL: rtsp://mediamtx:8554/live/hat
+      # Reaches the `postgres` service by name over the shared db_default
+      # network (see db/docker-compose.yml) — same pattern as backend/'s
+      # docker-compose.yml.
+      DATABASE_URL: postgres://umpirehat:umpirehat_dev@postgres:5432/umpirehat
+      # Must match backend/'s docker-compose.yml exactly — this worker
+      # verifies the same JWTs backend/'s auth API issues.
+      JWT_SECRET: umpirehat-dev-secret-change-me
+      CONTROL_PORT: "4100"
+      # This instance's own reachable address, recorded on every session it
+      # creates. A real multi-instance deployment would set each instance's
+      # own reachable host here instead of the single Compose service name.
+      WORKER_HOST: worker:4100
+      MAX_SESSIONS_PER_INSTANCE: "4"
+    ports:
+      - "4100:4100"
+    volumes:
+      - ./output:/output
+    networks:
+      - default
+      - db_default
+    restart: unless-stopped
+
+networks:
+  db_default:
+    external: true

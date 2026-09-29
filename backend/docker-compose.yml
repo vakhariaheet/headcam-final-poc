@@ -1,0 +1,21 @@
+services:
+  api:
+    build: .
+    container_name: umpirehat-backend
+    environment:
+      # Reaches the `postgres` service by name over the shared db_default
+      # network (see db/docker-compose.yml).
+      DATABASE_URL: postgres://umpirehat:umpirehat_dev@postgres:5432/umpirehat
+      JWT_SECRET: umpirehat-dev-secret-change-me
+      NODE_ENV: development
+      # Set SMTP_HOST plus SMTP credentials for real verification delivery.
+      # Development returns the code explicitly when SMTP is absent.
+      PORT: "4000"
+    ports:
+      - "4000:4000"
+    networks:
+      - db_default
+
+networks:
+  db_default:
+    external: true
