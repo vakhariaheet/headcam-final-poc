@@ -37,12 +37,13 @@ services:
       # Must match backend/'s docker-compose.yml exactly — this worker
       # verifies the same JWTs backend/'s auth API issues.
       JWT_SECRET: umpirehat-dev-secret-change-me
+      BACKEND_INTERNAL_URL: ${BACKEND_INTERNAL_URL:-http://api:4000}
+      WORKER_API_SECRET: ${WORKER_API_SECRET:-}
       CONTROL_PORT: "4100"
       # This instance's own reachable address, recorded on every session it
       # creates. A real multi-instance deployment would set each instance's
       # own reachable host here instead of the single Compose service name.
       WORKER_HOST: worker:4100
-      MAX_SESSIONS_PER_INSTANCE: "4"
     ports:
       - "4100:4100"
     volumes:

@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include "wifi_fast_connect.h"
 #include "ble_provisioning_init.h"
+#include "hat_control.h"
 
 void app_example(void)
 {
@@ -16,5 +17,7 @@ void app_example(void)
 	// Provisioning owns credentials; do not load/save an unrelated flash profile.
 	wifi_fast_connect_enable(0);
 	printf("\r\n[hat] native provisioning build %s %s\r\n", __DATE__, __TIME__);
+	// Ownership and pairing state must exist before BLE builds its advertisement.
+	hat_control_start();
 	ble_provisioning_start();
 }

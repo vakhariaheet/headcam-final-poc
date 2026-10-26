@@ -19,6 +19,12 @@ export function errorHandler(
     reply.status(error.statusCode).send(body);
     return;
   }
+  if ('validation' in error && error.validation) {
+    // Route schema rejections are the caller's mistake, not a server fault.
+    const body: ErrorResponseBody = { error: { code: 'VALIDATION_ERROR', message: error.message } };
+    reply.status(400).send(body);
+    return;
+  }
 
   // request.log is a per-request child of the shared logger (see
   // logger.ts) — already carries reqId/method/url, so the exception is

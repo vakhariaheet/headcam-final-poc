@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/hat_connection_provider.dart';
 import '../theme/app_theme.dart';
 import '../widgets/device_card.dart';
+import '../widgets/firmware_update_card.dart';
 
 /// Devices tab: the current UmpireHat's connection/health, with a way to
 /// (re)pair. This app only ever manages one connected hat at a time today
@@ -37,6 +38,8 @@ class DevicesScreen extends ConsumerWidget {
                     Navigator.of(context).pushNamed('/select-hat'),
               ),
               if (isConnected) ...[
+                const SizedBox(height: AppSpacing.md),
+                const FirmwareUpdateCard(),
                 const SizedBox(height: AppSpacing.md),
                 OutlinedButton(
                   onPressed: () =>

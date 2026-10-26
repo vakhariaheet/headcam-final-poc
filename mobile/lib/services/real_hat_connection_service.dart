@@ -1,29 +1,32 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
 import '../models/hat_device.dart';
+import '../models/hat_status.dart';
 import 'hat_connection_service.dart';
+import 'hat_ownership_protocol.dart';
 
 final _provisioningServiceUuid = Guid('FFE0');
 final _credentialsCharUuid = Guid('FFE1');
 final _statusCharUuid = Guid('FFE2');
+final _statusServiceGuid = Guid(hatStatusServiceUuid);
 const _advertisedNamePrefix = 'UmpireHat_';
 
 /// `flutter_blue_plus`-backed [HatConnectionService] talking to the GATT
 /// service `firmware/amb82_hat_native` advertises (spec §4.2/§4.3):
 /// service 0xFFE0, write characteristic 0xFFE1 (credentials in), notify
 /// characteristic 0xFFE2 (status out). See the native firmware README for the
-/// exact wire protocol both sides agree on — notably, `session_token` is
-/// deliberately omitted from the FFE1 payload (unlike the spec's example):
-/// the AmebaPro2 BLE stack hard-caps a characteristic's buffer at 230
-/// bytes, and a real session JWT alone runs longer than that. Re-add it
-/// once a chunked-write protocol exists on both sides.
+/// exact wire protocol both sides agree on. Every command except `CLAIM`
+/// needs a link authenticated with [authenticate]; the hat rejects others
+/// with ATT application error 0x81.
 class RealHatConnectionService implements HatConnectionService {
   BluetoothDevice? _device;
   BluetoothCharacteristic? _credentialsChar;
   BluetoothCharacteristic? _statusChar;
+  Uint8List? _sessionKey;
   int _streamOperation = 0;
   void Function()? _cancelStreamWait;
 
@@ -77,7 +80,16 @@ class RealHatConnectionService implements HatConnectionService {
 
           final id = result.device.remoteId.str;
           if (seen.add(id)) {
-            yield HatDevice(id: id, name: name, rssi: result.rssi);
+            final flags = HatAdvertisementFlags.fromServiceData(
+              result.advertisementData.serviceData[_statusServiceGuid],
+            );
+            yield HatDevice(
+              id: id,
+              name: name,
+              rssi: result.rssi,
+              pairingMode: flags.pairingMode,
+              owned: flags.owned,
+            );
           }
         }
       }
@@ -105,6 +117,102 @@ class RealHatConnectionService implements HatConnectionService {
       (c) => c.uuid == _statusCharUuid,
     );
     _device = device;
+    _sessionKey = null; // a new link must authenticate again
+  }
+
+  @override
+  Future<String> claim() async {
+    final keyPair = HatClaimKeyPair.generate();
+    final reply = await _exchange({
+      'cmd': 'CLAIM',
+      'pub': base64.encode(keyPair.publicKey),
+    }, (value) => value['event'] == 'claim');
+    final hatPublic = reply['pub'];
+    if (reply['status'] != 'ok' || hatPublic is! String) {
+      throw HatOwnershipError(reply['reason'] as String? ?? 'unknown_error');
+    }
+    try {
+      return hexEncode(keyPair.deriveOwnerKey(base64.decode(hatPublic)));
+    } on Object {
+      throw const HatOwnershipError('bad_hat_key');
+    }
+  }
+
+  @override
+  Future<void> authenticate(String ownerKey) async {
+    final challenge = await _exchange({
+      'cmd': 'AUTH_START',
+    }, (value) => value['event'] == 'auth');
+    final nonce = challenge['nonce'];
+    if (nonce is! String) {
+      throw HatOwnershipError(
+        challenge['reason'] as String? ?? 'unknown_error',
+      );
+    }
+    final result = await _exchange({
+      'cmd': 'AUTH',
+      'mac': hatOwnerProof(ownerKeyHex: ownerKey, nonceHex: nonce),
+    }, (value) => value['event'] == 'auth' && value['nonce'] == null);
+    if (result['status'] != 'ok') {
+      throw HatOwnershipError(result['reason'] as String? ?? 'unknown_error');
+    }
+    _sessionKey = hatSessionKey(ownerKeyHex: ownerKey, nonceHex: nonce);
+  }
+
+  /// Seals [params] under this link's session key; see [authenticate].
+  String _seal(String command, Map<String, Object?> params) {
+    final key = _sessionKey;
+    if (key == null) {
+      throw StateError('Authenticate with the hat before sending $command.');
+    }
+    return hatSeal(sessionKey: key, command: command, params: params);
+  }
+
+  /// Writes [command] and returns the first FFE2 notification [isReply]
+  /// accepts. Listening starts before the write so a fast reply is not missed.
+  Future<Map<String, dynamic>> _exchange(
+    Map<String, Object?> command,
+    bool Function(Map<String, dynamic> value) isReply,
+  ) async {
+    final commandChar = _credentialsChar;
+    final status = _statusChar;
+    if (commandChar == null || status == null) {
+      throw StateError('Connect to the hat first.');
+    }
+    await status.setNotifyValue(true);
+    final reply = Completer<Map<String, dynamic>>();
+    final subscription = status.onValueReceived.listen(
+      (bytes) {
+        try {
+          final value = jsonDecode(utf8.decode(bytes));
+          if (value is Map<String, dynamic> &&
+              isReply(value) &&
+              !reply.isCompleted) {
+            reply.complete(value);
+          }
+        } on FormatException {
+          /* Ignore unrelated or malformed notifications. */
+        }
+      },
+      onError: (Object error) {
+        if (!reply.isCompleted) {
+          reply.completeError(const HatOwnershipError('ble_disconnected'));
+        }
+      },
+    );
+    try {
+      await commandChar.write(
+        hatCommand(command),
+        withoutResponse: false,
+        allowLongWrite: true,
+      );
+      return await reply.future.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () => throw const HatOwnershipError('timeout'),
+      );
+    } finally {
+      await subscription.cancel();
+    }
   }
 
   @override
@@ -119,11 +227,14 @@ class RealHatConnectionService implements HatConnectionService {
       throw StateError('provisionHotspot called before connect()');
     }
 
+    // Credentials only ever cross the air sealed with the session key.
     final payload = jsonEncode({
       'cmd': 'SET_STA',
-      'ssid': ssid,
-      'pass': passphrase,
-      'band': band,
+      'sealed': _seal('SET_STA', {
+        'ssid': ssid,
+        'pass': passphrase,
+        'band': band,
+      }),
     });
 
     await statusChar.setNotifyValue(true);
@@ -177,8 +288,13 @@ class RealHatConnectionService implements HatConnectionService {
   Future<void> startStream({String? ingestUrl}) async {
     final operation = ++_streamOperation;
     try {
+      // An ingest URL may embed a stream key, so it is sealed.
       await _streamCommand(
-        {'cmd': 'START_STREAM', 'url': ?ingestUrl},
+        {
+          'cmd': 'START_STREAM',
+          if (ingestUrl != null)
+            'sealed': _seal('START_STREAM', {'url': ingestUrl}),
+        },
         'publishing',
         operation,
       );
@@ -203,7 +319,7 @@ class RealHatConnectionService implements HatConnectionService {
       _streamCommand({'cmd': 'STOP_STREAM'}, 'stopped', ++_streamOperation);
 
   Future<void> _streamCommand(
-    Map<String, String> command,
+    Map<String, Object?> command,
     String expected,
     int operation,
   ) async {
@@ -257,15 +373,72 @@ class RealHatConnectionService implements HatConnectionService {
     }
   }
 
-  @override
-  Stream<HatTelemetry> telemetryStream() {
-    // amb82_hat_native doesn't push periodic telemetry over BLE yet (see
-    // its README's "known limitations") - only the one-time status message
-    // provisionHotspot already consumes. Returning an empty stream is
-    // deliberate, not a placeholder bug: the Live screen won't show
-    // numbers against real hardware until that firmware piece exists.
-    return const Stream.empty();
+  /// Every JSON object the hat notifies on FFE2 while this link lasts.
+  /// Status, stream, telemetry, camera, and update events share it.
+  Stream<Map<String, dynamic>> _notifications() async* {
+    final status = _statusChar;
+    if (status == null) return;
+    await status.setNotifyValue(true);
+    await for (final bytes in status.onValueReceived) {
+      try {
+        final value = jsonDecode(utf8.decode(bytes));
+        if (value is Map<String, dynamic>) yield value;
+      } on FormatException {
+        /* Ignore malformed notifications. */
+      }
+    }
   }
+
+  @override
+  Stream<HatTelemetry> telemetryStream() => _notifications()
+      .map(HatTelemetry.fromNotification)
+      .where((sample) => sample != null)
+      .cast<HatTelemetry>();
+
+  @override
+  Future<HatInfo> readInfo() async {
+    final reply = await _exchange({
+      'cmd': 'INFO',
+    }, (value) => value['event'] == 'info');
+    final info = HatInfo.fromNotification(reply);
+    if (info == null) throw const FormatException('Malformed hat INFO reply');
+    return info;
+  }
+
+  @override
+  Stream<HatCameraFault> cameraFaults() => _notifications()
+      .map(HatCameraFault.fromNotification)
+      .where((fault) => fault != null)
+      .cast<HatCameraFault>();
+
+  @override
+  Future<void> updateFirmware(FirmwareRelease release) async {
+    // The hash is what lets the hat trust an image fetched over plain
+    // HTTP, so it only travels sealed.
+    final Map<String, dynamic> reply;
+    try {
+      reply = await _exchange({
+        'cmd': 'UPDATE_FW',
+        'sealed': _seal('UPDATE_FW', {
+          'url': release.downloadUrl,
+          'size': release.sizeBytes,
+          'sha256': release.sha256,
+          'version': release.version,
+        }),
+      }, (value) => value['event'] == 'ota');
+    } on HatOwnershipError catch (e) {
+      throw HatUpdateError(e.reason); // timeout or a dropped link
+    }
+    final event = HatUpdateEvent.fromNotification(reply);
+    if (event is HatUpdateFailed) throw HatUpdateError(event.reason);
+    if (event is! HatUpdateStarted) throw const HatUpdateError('no_reply');
+  }
+
+  @override
+  Stream<HatUpdateEvent> updateEvents() => _notifications()
+      .map(HatUpdateEvent.fromNotification)
+      .where((event) => event != null)
+      .cast<HatUpdateEvent>();
 
   @override
   Future<void> disconnect() async {
@@ -275,6 +448,7 @@ class RealHatConnectionService implements HatConnectionService {
     _device = null;
     _credentialsChar = null;
     _statusChar = null;
+    _sessionKey = null;
   }
 }
 

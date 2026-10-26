@@ -51,18 +51,30 @@ class SettingsScreen extends ConsumerWidget {
             _ChannelCard(
               icon: Icons.smart_display_outlined,
               label: 'YouTube Live',
-              subtitle: 'Google account · YouTube Data API v3',
+              subtitle: channels.channelName ?? 'Connect your YouTube channel',
               connected: channels.googleConnected,
-              onPressed: channelsNotifier.signInWithGoogle,
+              onPressed: () {
+                if (!channels.busy) channelsNotifier.signInWithGoogle();
+              },
             ),
             const SizedBox(height: AppSpacing.sm),
-            _ChannelCard(
-              icon: Icons.facebook_outlined,
-              label: 'Facebook Live',
-              subtitle: 'Meta account · Facebook Pages API',
-              connected: channels.metaConnected,
-              onPressed: channelsNotifier.signInWithMeta,
+            TextButton(
+              onPressed: channels.busy ? null : channelsNotifier.refresh,
+              child: const Text('Refresh connection'),
             ),
+            if (channels.googleConnected)
+              TextButton(
+                onPressed: channels.busy
+                    ? null
+                    : channelsNotifier.disconnectYouTube,
+                child: const Text('Disconnect YouTube'),
+              ),
+            if (channels.error != null)
+              Text(
+                channels.error!,
+                style: const TextStyle(color: AppColors.error),
+              ),
+            const Text('Facebook streaming is not available yet.'),
             const SizedBox(height: AppSpacing.lg),
             Card(
               child: ListTile(

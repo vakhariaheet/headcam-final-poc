@@ -18,3 +18,16 @@ export const SMTP_USER: string | undefined = process.env.SMTP_USER;
 export const SMTP_PASSWORD: string | undefined = process.env.SMTP_PASSWORD;
 export const SMTP_FROM: string = process.env.SMTP_FROM
   ?? 'CreasePoint <no-reply@creasepoint.local>';
+
+// Where published firmware images (<release id>.bin) are stored.
+export const FIRMWARE_DIR: string = process.env.FIRMWARE_DIR ?? 'firmware-releases';
+// Plain-HTTP origin the hat can reach on its own Wi-Fi, e.g.
+// http://192.168.1.20:4000. The hat has no TLS client for updates (the
+// image is verified by SHA-256 instead), and cannot reach the phone's
+// localhost, so this must be set whenever the app talks to the backend
+// through HTTPS or localhost.
+// Empty counts as unset: docker-compose passes "" for an unset variable.
+const firmwareDownloadBaseUrl = process.env.FIRMWARE_DOWNLOAD_BASE_URL;
+export const FIRMWARE_DOWNLOAD_BASE_URL: string | undefined = (
+  firmwareDownloadBaseUrl === '' ? undefined : firmwareDownloadBaseUrl
+);

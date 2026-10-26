@@ -24,12 +24,16 @@ typedef struct {
 typedef struct {
     SemaphoreHandle_t lock;
     QueueHandle_t frames;
-    bool ready, desired, accepting, discontinuity;
+    bool ready, desired, accepting;
+    unsigned discontinuity; // 1: invalid size, 2: allocation, 3: full queue
     uint32_t generation, sender_generation;
     uint8_t conn_id;
     char url[HAT_RTMP_URL_MAX];
 } publisher;
 static publisher *instance;
+// Telemetry counters; single writer (sender task), word-sized reads elsewhere.
+static volatile uint32_t sent_bytes_total;
+static const char *volatile stream_state = "idle";
 
 static bool is_cancelled(void *arg)
 {
@@ -47,6 +51,7 @@ static void report(publisher *p, uint32_t generation, const char *status)
     uint8_t conn_id = p->conn_id;
     xSemaphoreGive(p->lock);
     if (!current) return;
+    stream_state = status;
     printf("\r\n[hat-stream] %s\r\n", status);
     int size = snprintf(json, sizeof(json), "{\"event\":\"stream\",\"status\":\"%s\"}", status);
     ble_provisioning_service_notify_status(conn_id, json, (uint16_t)size);
@@ -84,6 +89,7 @@ static void sender(void *arg)
         report(p, generation, "connecting");
         hat_rtmp_client *client = hat_rtmp_open(url);
         bool published = false;
+        const char *reconnect_reason = "connect_failed";
         if (client && !is_cancelled(p)) {
             xSemaphoreTake(p->lock, portMAX_DELAY);
             p->accepting = p->generation == generation && p->desired;
@@ -91,15 +97,35 @@ static void sender(void *arg)
             xSemaphoreGive(p->lock);
             while (!is_cancelled(p)) {
                 xSemaphoreTake(p->lock, portMAX_DELAY);
-                bool broken = p->discontinuity;
+                unsigned broken = p->discontinuity;
+                if (broken) p->accepting = false;
                 xSemaphoreGive(p->lock);
-                if (broken || !hat_rtmp_poll(client)) break;
+                if (broken) {
+                    const char *reason = broken == 3 ? "frame_queue_full" :
+                        broken == 2 ? "frame_allocation_failed" : "invalid_frame_size";
+                    drain(p);
+                    hat_rtmp_resync(client);
+                    printf("\r\n[hat-stream] resync reason=%s; keeping connection\r\n", reason);
+                    xSemaphoreTake(p->lock, portMAX_DELAY);
+                    p->discontinuity = 0;
+                    p->accepting = p->desired && p->generation == generation;
+                    xSemaphoreGive(p->lock);
+                    continue;
+                }
+                if (!hat_rtmp_poll(client)) {
+                    reconnect_reason = "server_read_failed";
+                    break;
+                }
                 queued_frame frame;
                 if (xQueueReceive(p->frames, &frame, pdMS_TO_TICKS(100)) != pdPASS) continue;
                 bool ok = frame.generation == generation && !is_cancelled(p) &&
                     hat_rtmp_video(client, frame.bytes, frame.size, frame.timestamp);
+                if (ok) sent_bytes_total += frame.size;
                 free(frame.bytes);
-                if (!ok) break;
+                if (!ok) {
+                    reconnect_reason = "video_send_or_packetize_failed";
+                    break;
+                }
                 if (!published && hat_rtmp_has_video(client)) {
                     published = true; backoff = 1000;
                     report(p, generation, "publishing");
@@ -112,6 +138,7 @@ static void sender(void *arg)
         hat_rtmp_close(client);
         drain(p);
         if (is_cancelled(p)) continue;
+        printf("\r\n[hat-stream] reconnect reason=%s\r\n", reconnect_reason);
         report(p, generation, "reconnecting");
         // Interruptible backoff: STOP or a replacement START wins immediately.
         uint32_t began = hat_rtmp_now();
@@ -120,6 +147,11 @@ static void sender(void *arg)
         }
         if (backoff < 30000) backoff = backoff * 2 > 30000 ? 30000 : backoff * 2;
     }
+}
+void hat_stream_stats(uint32_t *sent_bytes, const char **state)
+{
+    *sent_bytes = sent_bytes_total;
+    *state = stream_state;
 }
 void hat_stream_camera_ready(void)
 {
@@ -163,23 +195,29 @@ static int handle(void *arg, void *input, void *output)
     publisher *p = arg;
     mm_queue_item_t *item = input;
     xSemaphoreTake(p->lock, portMAX_DELAY);
-    bool accept = p->desired && p->accepting;
+    bool accept = p->desired && p->accepting && !p->discontinuity;
     uint32_t generation = p->generation;
-    xSemaphoreGive(p->lock);
-    if (!accept) return 0;
+    if (!accept) { xSemaphoreGive(p->lock); return 0; }
+    // Serialize enqueue with resynchronization so an in-flight producer cannot
+    // insert a pre-gap frame after the sender has drained the queue.
     queued_frame frame = { .size = item->size, .timestamp = item->timestamp, .generation = generation };
+    unsigned reason = 1;
     if (frame.size && frame.size <= HAT_MAX_FRAME) {
+        reason = 2;
         frame.bytes = malloc(frame.size);
         if (frame.bytes) {
             memcpy(frame.bytes, (void *)item->data_addr, frame.size);
-            if (xQueueSend(p->frames, &frame, 0) == pdPASS) return 0;
+            if (xQueueSend(p->frames, &frame, 0) == pdPASS) {
+                xSemaphoreGive(p->lock);
+                return 0;
+            }
+            reason = 3;
             free(frame.bytes);
         }
     }
-    // A missing reference frame corrupts dependent pictures. Reconnect and
-    // resume on a fresh SPS/PPS+IDR instead of sending a damaged GOP.
-    xSemaphoreTake(p->lock, portMAX_DELAY);
-    if (p->generation == generation) p->discontinuity = true;
+    // A missing reference frame corrupts dependent pictures. Resume on a fresh
+    // SPS/PPS+IDR within the current connection instead of disconnecting readers.
+    if (p->generation == generation && !p->discontinuity) p->discontinuity = reason;
     xSemaphoreGive(p->lock);
     return 0;
 }

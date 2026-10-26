@@ -5,10 +5,9 @@ providing real email/password authentication for the UmpireHat app —
 distinct from the OAuth *broadcast destination* stubs in the Flutter app
 (YouTube/Facebook, still mocked, see `mobile/README.md`).
 
-This is intentionally scoped to auth only. The database already has tables
-for devices, matches, stream sessions, telemetry, and OAuth integrations
-(spec §7.2) that this service doesn't touch — those would be separate
-follow-up endpoints.
+It also links hats to accounts and serves firmware releases for over-the-air
+updates (below). Matches, stream sessions, and telemetry tables (spec §7.2)
+are not served here yet.
 
 ## Endpoints
 
@@ -19,6 +18,11 @@ follow-up endpoints.
 | POST   | `/api/v1/auth/resend-verification` | — | `{ verificationToken }` |
 | POST   | `/api/v1/auth/login`   | —      | `{ email, password }`                         |
 | GET    | `/api/v1/auth/me`      | Bearer | —                                              |
+| GET    | `/api/v1/devices`      | Bearer | — (your linked hats, `{ items }`)              |
+| PUT    | `/api/v1/devices/{serialNumber}` | Bearer | `{ hardwareModel, firmwareVersion, cameraRestarts, cameraFailed }` |
+| DELETE | `/api/v1/devices/{serialNumber}` | Bearer | — (unlink one of your hats; 204)     |
+| GET    | `/api/v1/firmware-releases?hardwareModel=&limit=` | Bearer | — (newest first, `{ items }`) |
+| GET    | `/api/v1/firmware-releases/{id}/image` | — | — (the image, for the hat itself) |
 | GET    | `/health`              | —      | — (unversioned — standard practice for health checks) |
 
 Signup returns an email-verification challenge. Verification and login return
@@ -30,6 +34,39 @@ are stateless JWTs (30-day expiry), signed with `JWT_SECRET`.
 Verification codes expire after 10 minutes, allow five attempts, and can be
 resent after 30 seconds. Development responses include `developmentCode` when
 SMTP is absent. Production requires SMTP and never returns the code.
+
+### Hats and firmware
+
+- **Linking.** After the app proves ownership of a hat over BLE, it reads the
+  hat's `INFO` and calls `PUT /api/v1/devices/{serialNumber}` (the hat's
+  Bluetooth address, `AABBCCDDEEFF`). The first link returns 201, later
+  reconnects 200 and refresh `firmwareVersion`, `lastSeenAt`, and camera
+  health. A link from another account moves the hat there: the BLE claim,
+  which needs the hat's button, is the authority. The backend cannot verify
+  that claim itself, so anyone who knows a serial number could relink it;
+  production hats need a per-device factory key the backend checks first.
+  Linking only records ownership for the account; it grants no control over
+  the hat, which still requires the owner key on the phone.
+- **Releases.** Publish a build's `ota.bin` (bump `HAT_FIRMWARE_VERSION` in
+  `firmware/amb82_hat_native/src/mmfv2_video_example/hat_version.h` to the
+  same version first):
+  ```bash
+  npm run build
+  npm run firmware:publish -- --model AMB82_MINI_V1 --version 0.3.0 \
+    --file ~/Desktop/ddev/ameba-rtos-pro2/project/realtek_amebapro2_v0_example/GCC-RELEASE/build/ota.bin \
+    --notes "What changed"
+  ```
+  It records the size and SHA-256 and copies the image into `FIRMWARE_DIR`.
+  In the container: `docker compose exec api npm run firmware:publish -- ...`
+  with the file under `./firmware-releases/`.
+- **Downloads.** The app hands the hat a release's `downloadUrl`, size, and
+  SHA-256 (sealed over BLE); the hat downloads the image itself, with no
+  token, over **plain HTTP** (it verifies the hash instead of using TLS). So
+  `downloadUrl` must be an `http://` address reachable from the hat's Wi-Fi:
+  set `FIRMWARE_DOWNLOAD_BASE_URL` (e.g. `http://192.168.1.20:4000`). Without
+  it the app's own origin is used, which fails with 503 when that is HTTPS or
+  localhost. Images are served with an exact `Content-Length`, because the
+  hat does not accept chunked responses.
 
 Errors always come back as a uniform envelope:
 ```json
@@ -104,6 +141,27 @@ run on a fresh volume, per `db/README.md`); a fresh `docker compose up` on
 hashed verification-code table. Apply it manually to an existing database;
 Docker init scripts only run automatically for a fresh database volume.
 
+`db/init/006_devices_firmware.sql` makes `devices.ble_uuid` nullable (every
+hat advertises the same service UUID, so it cannot identify one), adds
+link/health columns to `devices`, and creates `firmware_releases`. Apply it to
+an existing database with
+`docker exec -i umpirehat-postgres psql -U umpirehat umpirehat < db/init/006_devices_firmware.sql`.
+
+## Tests
+
+The integration tests need a disposable database on `127.0.0.1:25432` (they
+refuse any other `DATABASE_URL`), with every `db/init` script applied:
+
+```bash
+docker run -d --rm --name hat-backend-test -p 127.0.0.1:25432:5432 \
+  -e POSTGRES_USER=umpirehat -e POSTGRES_PASSWORD=test_only -e POSTGRES_DB=hat_test \
+  -v "$PWD/../db/init:/docker-entrypoint-initdb.d:ro" timescale/timescaledb:2.17.2-pg16
+npm run build
+DATABASE_URL=postgres://umpirehat:test_only@127.0.0.1:25432/hat_test \
+  node --test tests/*.integration.cjs
+docker stop hat-backend-test
+```
+
 ## Verified
 
 All confirmed against the running service during setup (and re-confirmed
@@ -129,3 +187,5 @@ after the controller/service/versioning retrofit):
 | `SMTP_PORT`    | `587`                                                                |
 | `SMTP_USER` / `SMTP_PASSWORD` | optional SMTP credentials                            |
 | `SMTP_FROM`    | `CreasePoint <no-reply@creasepoint.local>`                           |
+| `FIRMWARE_DIR` | `firmware-releases` (relative to the working directory)            |
+| `FIRMWARE_DOWNLOAD_BASE_URL` | none; an `http://` origin the hat can reach, e.g. `http://192.168.1.20:4000` |

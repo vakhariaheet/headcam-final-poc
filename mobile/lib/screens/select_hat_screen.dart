@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/hat_device.dart';
 import '../state/hat_connection_provider.dart';
 import '../theme/app_theme.dart';
+import '../widgets/hat_connection_messages.dart';
 
 /// "Choose Existing Hat": lists already-paired hats ([pairedHatIdsProvider])
 /// that are currently reachable in a live BLE scan — "active" means
@@ -36,7 +37,17 @@ class _SelectHatScreenState extends ConsumerState<SelectHatScreen> {
 
   Future<void> _select(HatDevice device) async {
     await ref.read(hatConnectionProvider.notifier).connect(device);
-    if (mounted) Navigator.of(context).pop();
+    if (!mounted) return;
+    final failure = hatConnectionFailureMessage(
+      ref.read(hatConnectionProvider).status,
+    );
+    if (failure != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(failure), duration: const Duration(seconds: 8)),
+      );
+      return;
+    }
+    Navigator.of(context).pop();
   }
 
   @override

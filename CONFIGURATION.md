@@ -1,7 +1,9 @@
 # Configuration and secrets
 
-No project `.env` file is required for the current local development setup.
-The Docker Compose files supply development values directly. Node services
+The root `.env` holds YouTube configuration placeholders; fill them in before
+connecting a real channel. Pass `--env-file ../.env` to Compose from `backend/`
+and `cloud/`. See [YouTube setup](cloud/YOUTUBE.md).
+The Docker Compose files still supply database/JWT development values directly. Node services
 read process environment variables; they do not load `.env` files themselves.
 A Compose `.env` supplies interpolation values only: it does not override
 hardcoded service `environment` entries. Deployment must explicitly wire
@@ -16,8 +18,10 @@ real values into the container environment.
 | Mobile app | `BACKEND_BASE_URL`, `CLOUD_BASE_URL`, `HAT_INGEST_URL` | Flutter `--dart-define` build/run arguments |
 | Backend | `DATABASE_URL`, `JWT_SECRET`, `NODE_ENV`, `PORT`, `LOG_LEVEL` | Process/container environment; source has local development defaults |
 | Backend email | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` | Process/container environment; real email requires SMTP configuration |
-| Worker | `DATABASE_URL`, `JWT_SECRET`, `RTSP_URL`, `CONTROL_PORT`, `WORKER_HOST`, `MAX_SESSIONS_PER_INSTANCE`, `NODE_ENV`, `LOG_LEVEL` | Process/container environment |
-| Worker browser | `PUPPETEER_EXECUTABLE_PATH` | Optional process environment override; Docker image discovers Chrome |
+| Worker | `DATABASE_URL`, `JWT_SECRET`, `RTSP_URL`, `CONTROL_PORT`, `WORKER_HOST`, `NODE_ENV`, `LOG_LEVEL` | Process/container environment |
+| YouTube backend | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, `YOUTUBE_TOKEN_KEY`, `WORKER_API_SECRET` | Root `.env`, explicitly interpolated by Compose |
+| YouTube worker | `BACKEND_INTERNAL_URL`, `WORKER_API_SECRET` | Root `.env`, explicitly interpolated by Compose |
+| Scoreboard font | `OVERLAY_FONT_FILE` | Optional font path in worker; defaults to bundled DejaVu Sans Bold |
 | Database | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Database container environment |
 
 The worker and backend must use the same JWT secret. Database connection

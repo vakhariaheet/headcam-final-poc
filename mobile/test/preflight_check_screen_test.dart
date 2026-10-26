@@ -58,6 +58,7 @@ void main() {
       // no real accelerometer exists in this test environment.
       await tester.pump(const Duration(milliseconds: 350));
 
+      await tester.ensureVisible(find.text('Start Broadcast'));
       await tester.tap(find.text('Start Broadcast'));
       await tester.pumpAndSettle();
 
@@ -86,6 +87,7 @@ void main() {
       await tester.pumpAndSettle();
       await tester.pump(const Duration(milliseconds: 350));
 
+      await tester.ensureVisible(find.text('Start Broadcast'));
       await tester.tap(find.text('Start Broadcast'));
       await tester.pumpAndSettle();
 

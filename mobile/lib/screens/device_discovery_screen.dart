@@ -9,6 +9,7 @@ import '../state/hat_connection_provider.dart';
 import '../theme/app_theme.dart';
 import '../widgets/auth_scaffold.dart';
 import '../widgets/brand_header.dart';
+import '../widgets/hat_connection_messages.dart';
 
 const _blue = Color(0xFF0085FF);
 const _muted = Color(0xFF6B7A9C);
@@ -207,7 +208,8 @@ class _ScanningScreenState extends ConsumerState<_ScanningScreen>
       children: [
         const _Heading(
           'Searching for devices',
-          'Make sure your UmpireHat is turned on and nearby.',
+          'Turn on your UmpireHat and keep it nearby. '
+              '$hatPairingModeInstruction',
         ),
         const SizedBox(height: 28),
         Center(
@@ -354,6 +356,7 @@ class _ConnectingScreenState extends ConsumerState<_ConnectingScreen>
   late final AnimationController _animation;
   int _stage = 0;
   bool _failed = false;
+  String? _failureMessage;
 
   @override
   void initState() {
@@ -381,9 +384,12 @@ class _ConnectingScreenState extends ConsumerState<_ConnectingScreen>
     setState(() => _stage = 2);
     await connect;
     if (!mounted) return;
-    if (ref.read(hatConnectionProvider).status !=
-        HatConnectionStatus.connected) {
-      setState(() => _failed = true);
+    final status = ref.read(hatConnectionProvider).status;
+    if (status != HatConnectionStatus.connected) {
+      setState(() {
+        _failed = true;
+        _failureMessage = hatConnectionFailureMessage(status);
+      });
       return;
     }
     await Future<void>.delayed(const Duration(milliseconds: 350));
@@ -418,8 +424,9 @@ class _ConnectingScreenState extends ConsumerState<_ConnectingScreen>
         _Heading(
           _failed ? 'Connection failed' : 'Connecting...',
           _failed
-              ? 'We could not connect to your UmpireHat. Make sure it is '
-                    'nearby and try again.'
+              ? _failureMessage ??
+                    'We could not connect to your UmpireHat. Make sure it is '
+                        'nearby and try again.'
               : 'Please wait while we pair with your UmpireHat.',
         ),
         const SizedBox(height: 20),
@@ -445,7 +452,7 @@ class _ConnectingScreenState extends ConsumerState<_ConnectingScreen>
         const SizedBox(height: 22),
         _ConnectionStep('Initializing connection', _stateFor(0)),
         _ConnectionStep('Pairing with device...', _stateFor(1)),
-        _ConnectionStep('Verifying device', _stateFor(2)),
+        _ConnectionStep('Verifying ownership', _stateFor(2)),
         _ConnectionStep('Finalizing setup', _stateFor(3)),
         const Spacer(),
         if (_failed)
@@ -509,7 +516,7 @@ class _PairingSuccessScreen extends ConsumerWidget {
                 _SummaryRow(
                   Icons.battery_5_bar_outlined,
                   'Battery',
-                  battery == null ? 'Reading…' : '$battery%',
+                  battery == null ? 'Not reported' : '$battery%',
                 ),
               ],
             ),
@@ -800,7 +807,8 @@ class _DeviceOption extends StatelessWidget {
                     ),
                   ),
                   Text(
-                    'Signal strength: ${_signalLabel(device.rssi)}',
+                    '${hatPairingStateLabel(device)} · '
+                    'Signal: ${_signalLabel(device.rssi)}',
                     style: Theme.of(context).textTheme.bodySmall,
                   ),
                 ],

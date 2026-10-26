@@ -55,3 +55,6 @@ firmware/**/*.map
 # Python test caches
 __pycache__/
 *.py[cod]
+
+# Backend firmware release images
+backend/firmware-releases/

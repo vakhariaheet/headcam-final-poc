@@ -6,12 +6,19 @@ import '../models/cloud_status.dart';
 import '../services/cloud_control_api_client.dart';
 import '../services/user_session_store.dart';
 import 'user_auth_provider.dart';
+import 'scoreboard_provider.dart';
 import 'hat_connection_provider.dart';
 
 /// Override at build/run time with `--dart-define=CLOUD_BASE_URL=...` — see
 /// authApiClientProvider's BACKEND_BASE_URL for the same pattern.
-const _cloudBaseUrl = String.fromEnvironment('CLOUD_BASE_URL');
-const _ingestUrl = String.fromEnvironment('HAT_INGEST_URL');
+const _cloudBaseUrl = String.fromEnvironment(
+  'CLOUD_BASE_URL',
+  defaultValue: 'http://217.216.58.69:4100',
+);
+const _ingestUrl = String.fromEnvironment(
+  'HAT_INGEST_URL',
+  defaultValue: 'rtmp://217.216.58.69:1935/live/hat',
+);
 
 final cloudControlApiClientProvider = Provider<CloudControlApiClient>(
   (ref) => CloudControlApiClient(
@@ -87,7 +94,13 @@ class BroadcastSessionNotifier extends Notifier<BroadcastSessionState> {
       hatStartRequested = true;
       await hat.startStream(ingestUrl: _ingestUrl.isEmpty ? null : _ingestUrl);
       if (operation != _operation) return false;
-      sessionId = await _cloud.startSession(token);
+      sessionId = await _cloud.startSession(
+        token,
+        scoreboard: ref.read(scoreboardProvider),
+        target: ref.read(broadcastTargetProvider),
+        title: ref.read(broadcastTitleProvider),
+        privacy: ref.read(broadcastPrivacyProvider),
+      );
       if (operation != _operation) {
         await _cloud.stopSession(token, sessionId);
         return false;
@@ -115,6 +128,13 @@ class BroadcastSessionNotifier extends Notifier<BroadcastSessionState> {
       }
       return false;
     }
+  }
+
+  Future<void> updateScoreboard(Map<String, dynamic> scoreboard) async {
+    final id = state.sessionId;
+    final token = await _sessionStore.readToken();
+    if (id == null || token == null) throw StateError('No active broadcast.');
+    await _cloud.updateScoreboard(token, id, scoreboard);
   }
 
   /// Stop the hat and cloud independently: failure of either must not prevent

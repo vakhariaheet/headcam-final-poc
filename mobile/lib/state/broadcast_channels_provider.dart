@@ -1,72 +1,121 @@
-import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'dart:async';
 
-import '../services/channel_connection_store.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+import '../services/youtube_api_client.dart';
+import 'user_auth_provider.dart';
 
 enum AuthPlatform { youtube, facebook }
 
-final channelConnectionStoreProvider = Provider<ChannelConnectionStore>(
-  (ref) => ChannelConnectionStore(),
-);
+final youtubeApiClientProvider = Provider((ref) => YouTubeApiClient());
 
 class BroadcastChannelsState {
   const BroadcastChannelsState({
     this.googleConnected = false,
     this.metaConnected = false,
+    this.channelName,
+    this.busy = false,
+    this.error,
   });
-
   final bool googleConnected;
   final bool metaConnected;
-
-  bool get hasAnyChannel => googleConnected || metaConnected;
-
-  BroadcastChannelsState copyWith({
-    bool? googleConnected,
-    bool? metaConnected,
-  }) => BroadcastChannelsState(
-    googleConnected: googleConnected ?? this.googleConnected,
-    metaConnected: metaConnected ?? this.metaConnected,
-  );
+  final String? channelName;
+  final bool busy;
+  final String? error;
+  bool get hasAnyChannel => googleConnected;
 }
 
-/// Broadcast destination channels: "Sign in with Google (YouTube Data API
-/// v3 live scope)" and "Meta OAuth (Facebook Pages API)". Stubbed here —
-/// real OAuth needs API credentials this environment doesn't have, so
-/// connecting a channel just flips local state after a simulated delay —
-/// but that state is persisted per account ([ChannelConnectionStore]) so
-/// it survives app restarts: connecting a channel is a one-time, user-level
-/// action, not something repeated before every broadcast.
-///
-/// Not to be confused with real UmpireHat account auth — see
-/// state/user_auth_provider.dart.
 class BroadcastChannelsNotifier extends Notifier<BroadcastChannelsState> {
-  late final ChannelConnectionStore _store = ref.read(
-    channelConnectionStoreProvider,
-  );
-
+  bool _disposed = false;
+  int _epoch = 0;
   @override
   BroadcastChannelsState build() {
-    Future.microtask(_loadPersisted);
+    ref.watch(userAuthProvider.select((s) => s.currentUser?.id));
+    _disposed = false;
+    ref.onDispose(() {
+      _disposed = true;
+      ++_epoch;
+    });
+    Future.microtask(refresh);
     return const BroadcastChannelsState();
   }
 
-  Future<void> _loadPersisted() async {
-    final saved = await _store.load();
-    state = BroadcastChannelsState(
-      googleConnected: saved.google,
-      metaConnected: saved.meta,
-    );
+  Future<String> _token() async {
+    final token = await ref.read(userSessionStoreProvider).readToken();
+    if (token == null) throw StateError('Sign in first.');
+    return token;
+  }
+
+  Future<void> refresh() async {
+    final epoch = ++_epoch;
+    try {
+      final token = await ref.read(userSessionStoreProvider).readToken();
+      if (token == null || _disposed || epoch != _epoch) return;
+      final data = await ref
+          .read(youtubeApiClientProvider)
+          .request('GET', 'connection', token);
+      if (_disposed || epoch != _epoch) return;
+      state = BroadcastChannelsState(
+        googleConnected: data['connected'] == true,
+        channelName:
+            (data['channel'] as Map<String, dynamic>?)?['channel_name']
+                as String?,
+      );
+    } catch (_) {
+      if (!_disposed && epoch == _epoch) {
+        state = const BroadcastChannelsState(
+          error: 'Could not refresh YouTube connection.',
+        );
+      }
+    }
   }
 
   Future<void> signInWithGoogle() async {
-    await Future<void>.delayed(const Duration(milliseconds: 500));
-    state = state.copyWith(googleConnected: true);
-    await _store.setGoogleConnected(true);
+    if (state.busy) return;
+    final epoch = ++_epoch;
+    state = const BroadcastChannelsState(busy: true);
+    try {
+      final data = await ref
+          .read(youtubeApiClientProvider)
+          .request('POST', 'connect', await _token());
+      if (_disposed || epoch != _epoch) return;
+      final uri = Uri.parse(data['authorizationUrl'] as String);
+      if (uri.scheme != 'https' ||
+          uri.host != 'accounts.google.com' ||
+          !await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+        throw StateError('Could not open Google sign-in.');
+      }
+      if (!_disposed && epoch == _epoch) state = const BroadcastChannelsState();
+    } catch (error) {
+      if (!_disposed && epoch == _epoch) {
+        state = BroadcastChannelsState(error: error.toString());
+      }
+    }
   }
 
-  Future<void> signInWithMeta() async {
-    await Future<void>.delayed(const Duration(milliseconds: 500));
-    state = state.copyWith(metaConnected: true);
-    await _store.setMetaConnected(true);
+  Future<void> disconnectYouTube() async {
+    if (state.busy) return;
+    final epoch = ++_epoch;
+    state = BroadcastChannelsState(
+      googleConnected: state.googleConnected,
+      channelName: state.channelName,
+      busy: true,
+    );
+    try {
+      await ref
+          .read(youtubeApiClientProvider)
+          .request('DELETE', 'connection', await _token());
+      if (!_disposed && epoch == _epoch) state = const BroadcastChannelsState();
+    } catch (error) {
+      if (!_disposed && epoch == _epoch) {
+        state = BroadcastChannelsState(
+          googleConnected: state.googleConnected,
+          channelName: state.channelName,
+          error: error.toString(),
+        );
+      }
+    }
   }
 }
 

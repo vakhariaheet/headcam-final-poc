@@ -1,434 +1,513 @@
-import { execSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import Fastify from 'fastify';
-import { PNG } from 'pngjs';
-import puppeteer from 'puppeteer';
 
 import { requireAuth } from './auth';
 import { pool } from './db';
 import { logger } from './logger';
+import {
+  defaultScoreboard,
+  scoreboardSchema,
+  videoFilter,
+  writeScore,
+} from './scoreboard';
+import { youtubeControl } from './youtube';
 
 import type { ChildProcess } from 'node:child_process';
 
-import type { FastifyReply } from 'fastify';
-import type { Logger } from 'pino';
-import type { Browser, Page } from 'puppeteer';
+import type {
+  FastifyBaseLogger,
+  FastifyInstance,
+  FastifyReply,
+  FastifyRequest,
+} from 'fastify';
 
-const WIDTH = 1920;
-const HEIGHT = 1080;
-const FPS = 30;
+import type { Scoreboard } from './scoreboard';
 
-const DEFAULT_RTSP_URL = process.env.RTSP_URL ?? 'rtsp://mediamtx:8554/live/hat';
-const DEFAULT_OVERLAY_URL = `file://${path.join(process.cwd(), 'overlay.html')}`;
-const CONTROL_PORT = Number(process.env.CONTROL_PORT) || 4100;
-const MAX_SESSIONS_PER_INSTANCE = Number(process.env.MAX_SESSIONS_PER_INSTANCE) || 4;
-// This instance's own reachable address — recorded on every session it
-// creates, so a request can tell whether it landed on the instance that's
-// actually running that session (see findOwnedSession below).
-const WORKER_HOST = process.env.WORKER_HOST ?? `localhost:${CONTROL_PORT}`;
-
-// The base puppeteer image's cached Chrome build doesn't always match the
-// revision the npm-installed puppeteer version looks for by default, so
-// fall back to the path resolved at image build time (see Dockerfile).
-function resolveExecutablePath(): string | undefined {
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-    return process.env.PUPPETEER_EXECUTABLE_PATH;
-  }
-  try {
-    const resolved = fs.readFileSync('/app/chrome-path.txt', 'utf8').trim();
-    if (resolved) return resolved;
-  } catch {
-    // fall through to puppeteer's own default resolution
-  }
-  return undefined;
+const PORT = Number(process.env.CONTROL_PORT) || 4100;
+const HOST = process.env.WORKER_HOST ?? `localhost:${PORT}`;
+const RTSP = process.env.RTSP_URL ?? 'rtsp://mediamtx:8554/live/hat';
+interface CreateBody {
+  target?: 'recording' | 'youtube';
+  title?: string;
+  privacy?: 'private' | 'unlisted' | 'public';
+  scoreboard?: Scoreboard;
 }
-
-function ensureFifo(fifoPath: string): void {
-  if (fs.existsSync(fifoPath)) {
-    fs.unlinkSync(fifoPath);
-  }
-  execSync(`mkfifo ${fifoPath}`);
+interface Pipeline {
+  owner: string;
+  stopped: boolean;
+  child: ChildProcess | null;
+  task: Promise<void>;
+  folder: string;
+  scoreFile: string;
+  output: string;
+  youtube: boolean;
+  watchUrl?: string;
+  lastError?: string;
+  stopTask?: Promise<void>;
 }
-
-// Mirrors the filter_complex overlay + tee simulcast command from spec §5.3.
-// outputs is a list, not two fixed names, so a session can represent any
-// number of destinations (see cloud/README.md and the worker design notes
-// on why this matters for the per-platform toggle on Screen 4).
-function spawnFfmpeg(
-  rtspUrl: string,
-  fifoPath: string,
-  outputs: string[],
-  log: Logger,
-): ChildProcess {
-  const args = [
-    '-rtsp_transport', 'tcp',
-    '-i', rtspUrl,
-    '-f', 'rawvideo', '-pix_fmt', 'rgba', '-s', `${WIDTH}x${HEIGHT}`, '-r', String(FPS),
-    '-i', fifoPath,
-    '-filter_complex', `[0:v]scale=${WIDTH}:${HEIGHT}[bg];[bg][1:v]overlay=0:0:format=auto[outv]`,
-    '-map', '[outv]', '-map', '0:a?',
-    '-c:v', 'libx264', '-preset', 'veryfast',
-    '-b:v', '2500k', '-maxrate', '2800k', '-bufsize', '5600k', '-g', '60',
-    '-c:a', 'aac', '-b:a', '128k',
-    '-f', 'tee', outputs.join('|'),
-  ];
-
-  log.info({ rtspUrl, outputs }, 'spawning ffmpeg');
-  return spawn('ffmpeg', args, { stdio: ['ignore', 'inherit', 'inherit'] });
-}
-
-// Captures the rendered overlay DOM at ~30fps via page.screenshot() and
-// writes raw RGBA frames into the FIFO. This is a pragmatic stand-in for
-// CDP's native screencast API (spec §5.2) — simpler and deterministic for a
-// POC, though throughput depends on host performance rather than being
-// hardware-paced; a production implementation should move to the CDP
-// screencast session for better sustained framerate.
-async function startCaptureLoop(
-  page: Page,
-  writeStream: fs.WriteStream,
-  isAlive: () => boolean,
-  log: Logger,
-): Promise<void> {
-  const intervalMs = 1000 / FPS;
-
-  while (isAlive()) {
-    const start = Date.now();
-    try {
-      const png = await page.screenshot({ type: 'png', omitBackground: true });
-      const decoded = PNG.sync.read(Buffer.from(png));
-      if (!writeStream.destroyed) {
-        writeStream.write(decoded.data);
-      }
-    } catch (err) {
-      if (!isAlive()) break;
-      log.warn({ err }, 'capture frame error');
-    }
-    const elapsed = Date.now() - start;
-    const wait = Math.max(0, intervalMs - elapsed);
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, wait);
-    });
-  }
-}
-
-// What a POST /sessions request body may supply. Just overlayUrl — see
-// cloud/README.md and the plan this was built from for why rtspUrl and
-// output destinations aren't request fields: nothing yet has a real
-// per-hat source or real destination to supply, so exposing them as input
-// would imply a contract nothing fulfills.
-interface CreateSessionRequest {
-  overlayUrl?: string;
-}
-
-// What actually drives a running session, after defaults are applied.
-// Only overlayUrl can differ per session; rtspUrl is always the worker's
-// env default. outputs is a list, not two named fields, so a session can
-// represent any number of destinations.
-interface SessionConfig {
-  rtspUrl: string;
-  overlayUrl: string;
-  outputs: string[];
-}
-
-interface SessionPipeline {
-  ownerId: string; // request.userId at creation time — never client-supplied
-  page: Page;
-  stopRequested: boolean;
-  currentFfmpeg: ChildProcess | null;
-  loopPromise: Promise<void>;
-}
-
-interface StreamSessionRow {
+const sessions = new Map<string, Pipeline>();
+interface SessionRow {
   id: string;
   user_id: string;
-  worker_host: string | null;
+  worker_host: string;
   status: string;
+  scoreboard: Scoreboard;
 }
-
-// In-process only: the live Page/ChildProcess handles that actually control
-// a running session. stream_sessions in Postgres is the durable, shared
-// record of a session's existence/ownership/instance — any number of
-// worker instances can read that; only the instance holding the matching
-// entry here can actually control the session.
-const sessions = new Map<string, SessionPipeline>();
-
-// Resolves a request into a full SessionConfig. overlayUrl falls back to
-// the local demo overlay.html file (today's only option) — this is
-// deliberately the one field cloud/README.md documents as the real future
-// swap point (page.goto() → the real CricHeroes overlay_web_url).
-function resolveSessionConfig(body: CreateSessionRequest): SessionConfig {
-  return {
-    rtspUrl: DEFAULT_RTSP_URL,
-    overlayUrl: body.overlayUrl ?? DEFAULT_OVERLAY_URL,
-    outputs: [],
-  };
+function requestUser(request: FastifyRequest): string {
+  if (!request.userId) throw new Error('Missing session identity');
+  return request.userId;
 }
-
-function outputsForSession(sessionId: string): string[] {
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+async function status(id: string, value: string): Promise<void> {
+  await pool.query(
+    'UPDATE stream_sessions SET status=$2::stream_status_enum WHERE id=$1',
+    [id, value],
+  );
+}
+function ffmpegArgs(p: Pipeline): string[] {
   return [
-    `[f=mpegts]/output/${sessionId}_a.ts`,
-    `[f=mpegts]/output/${sessionId}_b.ts`,
+    '-hide_banner',
+    '-loglevel',
+    'warning',
+    '-nostats',
+    '-progress',
+    'pipe:1',
+    '-rtsp_transport',
+    'tcp',
+    '-timeout',
+    '10000000',
+    '-i',
+    RTSP,
+    '-f',
+    'lavfi',
+    '-i',
+    'anullsrc=channel_layout=stereo:sample_rate=48000',
+    '-map',
+    '0:v:0',
+    '-map',
+    '1:a:0',
+    '-vf',
+    videoFilter(p.scoreFile),
+    '-c:v',
+    'libx264',
+    '-preset',
+    'veryfast',
+    '-threads',
+    '2',
+    '-pix_fmt',
+    'yuv420p',
+    '-r',
+    '30',
+    '-g',
+    '60',
+    '-keyint_min',
+    '60',
+    '-sc_threshold',
+    '0',
+    '-b:v',
+    '6000k',
+    '-maxrate',
+    '6000k',
+    '-bufsize',
+    '12000k',
+    '-c:a',
+    'aac',
+    '-b:a',
+    '128k',
+    '-ar',
+    '48000',
+    '-shortest',
+    '-f',
+    p.youtube ? 'flv' : 'mpegts',
+    '-y',
+    p.output,
   ];
 }
-
-// Each iteration re-creates the FIFO and re-spawns FFmpeg, so the pipeline
-// recovers on its own once the simulator (or, later, the real hat) starts
-// publishing — this is a coarse stand-in for the reconnect holding-loop
-// behavior described in spec §8.1, which is tracked as follow-up work.
-async function runSessionLoop(sessionId: string, config: SessionConfig): Promise<void> {
-  const pipeline = sessions.get(sessionId);
-  if (!pipeline) return;
-
-  const log = logger.child({ sessionId });
-  const fifoPath = `/tmp/overlay_pipe_${sessionId}`;
-
-  while (!pipeline.stopRequested) {
-    ensureFifo(fifoPath);
-
-    let alive = true;
-    const isAlive = (): boolean => alive && !pipeline.stopRequested;
-
-    const ffmpeg = spawnFfmpeg(config.rtspUrl, fifoPath, config.outputs, log);
-    pipeline.currentFfmpeg = ffmpeg;
-    const writeStream = fs.createWriteStream(fifoPath);
-    writeStream.on('error', (err) => {
-      log.error({ err }, 'fifo write error');
+async function runPipeline(id: string, pipeline: Pipeline): Promise<void> {
+  const p = pipeline;
+  let failures = 0;
+  let attempt = 0;
+  const recordingOutput = p.output;
+  while (!p.stopped && failures < 10) {
+    if (!p.youtube) p.output = recordingOutput.replace(/\.ts$/, `-${attempt}.ts`);
+    attempt += 1;
+    let progress = '';
+    let gotFrame = false;
+    const began = Date.now();
+    const child = spawn('ffmpeg', ffmpegArgs(p), {
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
-
-    const capturePromise = startCaptureLoop(pipeline.page, writeStream, isAlive, log);
-
-    const exitCode = await new Promise<number | NodeJS.Signals | null>((resolve) => {
-      ffmpeg.on('exit', (code, signal) => {
-        resolve(code ?? signal);
-      });
+    p.child = child;
+    // Do not pipe FFmpeg stderr directly: it can contain a YouTube stream key.
+    // Drain diagnostics without logging arbitrary chunks: a stream key can be
+    // split across chunks and evade URL redaction.
+    child.stderr.on('data', () => {
+      p.lastError = 'Encoder reported a diagnostic; check source connectivity.';
     });
-
-    pipeline.currentFfmpeg = null;
-    alive = false;
-    await capturePromise;
-    writeStream.destroy();
-
-    log.info({ exitCode }, 'ffmpeg exited');
-    if (pipeline.stopRequested) break;
-
+    let lastProgress = Date.now();
+    child.stdout.on('data', (chunk: Buffer) => {
+      progress = (progress + chunk.toString()).slice(-8192);
+      if (/frame=\s*[1-9]\d*/.test(progress)) {
+        lastProgress = Date.now();
+        if (!gotFrame && !p.stopped) {
+          gotFrame = true;
+          status(id, 'LIVE').catch(() => {
+            p.stopped = true;
+            child.kill('SIGTERM');
+          });
+        }
+      }
+      if (progress.includes('progress=')) progress = '';
+    });
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastProgress > 30000) child.kill('SIGKILL');
+    }, 5000);
     await new Promise<void>((resolve) => {
-      setTimeout(resolve, 3000);
+      child.once('error', () => {
+        p.lastError = 'Encoder could not start.';
+        resolve();
+      });
+      child.once('close', () => resolve());
     });
+    clearInterval(watchdog);
+    p.child = null;
+    if (p.stopped) break;
+    failures = gotFrame && Date.now() - began > 60000 ? 1 : failures + 1;
+    await status(id, 'RECONNECTING');
+    // Short interruptible retry wait, without unbounded producer queues.
+    for (let i = 0; i < 30 && !p.stopped; i += 1) await delay(100);
+  }
+  if (!p.stopped) {
+    await status(id, 'FAILED');
+    if (p.youtube) await youtubeControl('stop', { sessionId: id, userId: p.owner });
   }
 }
-
-async function startSession(
-  sessionId: string,
-  ownerId: string,
-  config: SessionConfig,
-  browser: Browser,
-): Promise<void> {
-  const page = await browser.newPage();
-  await page.setViewport({ width: WIDTH, height: HEIGHT, deviceScaleFactor: 1 });
-  await page.goto(config.overlayUrl);
-
-  const pipeline: SessionPipeline = {
-    ownerId,
-    page,
-    stopRequested: false,
-    currentFfmpeg: null,
-    loopPromise: Promise.resolve(),
-  };
-  sessions.set(sessionId, pipeline);
-
-  pipeline.loopPromise = runSessionLoop(sessionId, config).catch(async (err: unknown) => {
-    logger.child({ sessionId }).error({ err }, 'session fatal error');
+async function stopPipeline(id: string, pipeline: Pipeline): Promise<void> {
+  const p = pipeline;
+  p.stopped = true;
+  const { child } = p;
+  child?.kill('SIGTERM');
+  const kill = setTimeout(() => child?.kill('SIGKILL'), 5000);
+  try {
+    await p.task;
+    if (p.youtube) await youtubeControl('stop', { sessionId: id, userId: p.owner });
     await pool.query(
-      "UPDATE stream_sessions SET status = 'FAILED', ended_at = now() WHERE id = $1",
-      [sessionId],
+      "UPDATE stream_sessions SET status='TERMINATED',ended_at=now() WHERE id=$1",
+      [id],
     );
-  });
+    fs.rmSync(p.folder, { recursive: true, force: true });
+    sessions.delete(id);
+  } finally {
+    clearTimeout(kill);
+  }
 }
-
-// A stopped session is gone, not paused — matches Kill Switch semantics.
-async function stopSession(sessionId: string): Promise<void> {
-  const pipeline = sessions.get(sessionId);
-  if (!pipeline) return;
-
-  pipeline.stopRequested = true;
-  pipeline.currentFfmpeg?.kill('SIGTERM');
-  await pipeline.loopPromise;
-  await pipeline.page.close();
-  sessions.delete(sessionId);
-
-  await pool.query(
-    "UPDATE stream_sessions SET status = 'TERMINATED', ended_at = now() WHERE id = $1",
-    [sessionId],
-  );
-}
-
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-// Looks up a session's durable Postgres row and checks both ownership and
-// instance placement, replying with the right error and returning null if
-// either check fails — every route touching an existing session shares
-// this rather than repeating the same three checks.
-async function findOwnedSession(
-  sessionId: string,
-  userId: string,
-  reply: FastifyReply,
-): Promise<StreamSessionRow | null> {
-  // A malformed :id (not shaped like a UUID at all) is just as much "no
-  // such session" as a well-formed one that doesn't match a row — but
-  // without this check it reaches Postgres as raw input and comes back as
-  // an unhandled invalid-UUID-syntax error instead of a clean 404.
-  if (!UUID_PATTERN.test(sessionId)) {
-    reply.status(404).send({ error: { code: 'NOT_FOUND', message: 'Session not found' } });
+async function owned(id: string, userId: string, reply: FastifyReply) {
+  if (!uuid.test(id)) {
+    reply.code(404).send({ error: { message: 'Session not found' } });
     return null;
   }
-
-  const result = await pool.query<StreamSessionRow>(
-    'SELECT id, user_id, worker_host, status FROM stream_sessions WHERE id = $1',
-    [sessionId],
+  const result = await pool.query<SessionRow>(
+    'SELECT * FROM stream_sessions WHERE id=$1',
+    [id],
   );
   const row = result.rows[0];
-  if (!row) {
-    reply.status(404).send({ error: { code: 'NOT_FOUND', message: 'Session not found' } });
+  if (row?.user_id !== userId) {
+    reply.code(404).send({ error: { message: 'Session not found' } });
     return null;
   }
-  if (row.user_id !== userId) {
-    reply.status(403).send({ error: { code: 'FORBIDDEN', message: 'Not your session' } });
-    return null;
-  }
-  if (row.worker_host !== WORKER_HOST) {
-    reply.status(409).send({
-      error: {
-        code: 'WRONG_INSTANCE',
-        message: 'This session is running on a different worker instance',
-        workerHost: row.worker_host,
-      },
-    });
+  if (row.worker_host !== HOST) {
+    reply
+      .code(409)
+      .send({ error: { message: 'Session belongs to a different worker' } });
     return null;
   }
   return row;
 }
-
-function buildApp(browser: Browser) {
-  const app = Fastify({ loggerInstance: logger });
-
-  app.post<{ Body: CreateSessionRequest | undefined }>(
+export function buildApp(): FastifyInstance {
+  const app = Fastify({
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+    loggerInstance: logger as FastifyBaseLogger,
+    ajv: { customOptions: { removeAdditional: false, coerceTypes: false } },
+  });
+  app.setErrorHandler((error, request, reply) => {
+    // Database/upstream details stay out of client messages and credential logs.
+    if (error && typeof error === 'object' && 'validation' in error) {
+      reply.code(400).send({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Invalid broadcast or scoreboard fields.',
+        },
+      });
+      return;
+    }
+    request.log.error(
+      { errorType: error instanceof Error ? error.name : 'Unknown' },
+      'Worker request failed',
+    );
+    reply.code(503).send({
+      error: {
+        code: 'SERVICE_UNAVAILABLE',
+        message:
+          'Broadcast service failed. Check the worker configuration and YouTube connection.',
+      },
+    });
+  });
+  app.post<{ Body: CreateBody }>(
     '/sessions',
-    { preHandler: requireAuth },
+    {
+      preHandler: requireAuth,
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            target: { type: 'string', enum: ['recording', 'youtube'] },
+            title: { type: 'string', minLength: 1, maxLength: 100 },
+            privacy: {
+              type: 'string',
+              enum: ['private', 'unlisted', 'public'],
+            },
+            scoreboard: scoreboardSchema,
+          },
+        },
+      },
+    },
     async (request, reply) => {
-      const { userId } = request;
-      if (!userId) {
-        reply
-          .status(401)
-          .send({ error: { code: 'UNAUTHORIZED', message: 'Missing bearer token' } });
-        return;
+      const body = request.body ?? {};
+      const userId = requestUser(request);
+      // One shared hat path in this POC: never let another account silently
+      // broadcast the same camera concurrently. Device-bound routing comes later.
+      const db = await pool.connect();
+      let id: string;
+      try {
+        await db.query('BEGIN');
+        await db.query('SELECT pg_advisory_xact_lock(8219,1)');
+        const user = await db.query('SELECT 1 FROM users WHERE id=$1', [
+          userId,
+        ]);
+        if (!user.rowCount) {
+          await db.query('ROLLBACK');
+          return await reply.code(401).send({
+            error: {
+              message:
+                'Sign in through the deployed backend; this user does not exist here.',
+            },
+          });
+        }
+        const active = await db.query(
+          "SELECT 1 FROM stream_sessions WHERE status IN ('INITIALIZING','LIVE','RECONNECTING')",
+        );
+        if (active.rowCount) {
+          await db.query('ROLLBACK');
+          return await reply.code(409).send({
+            error: {
+              message:
+                'The hat already has an active broadcast. Stop it first.',
+            },
+          });
+        }
+        const result = await db.query<{ id: string }>(
+          `INSERT INTO stream_sessions
+        (session_token,user_id,status,hat_ingress_rtsp_url,worker_host,scoreboard)
+        VALUES (gen_random_uuid()::text,$1,'INITIALIZING',$2,$3,$4) RETURNING id`,
+          [userId, RTSP, HOST, body.scoreboard ?? defaultScoreboard],
+        );
+        id = result.rows[0].id;
+        await db.query('COMMIT');
+      } catch (err) {
+        await db.query('ROLLBACK');
+        throw err;
+      } finally {
+        db.release();
       }
-
-      if (sessions.size >= MAX_SESSIONS_PER_INSTANCE) {
-        reply.status(503).send({
-          error: { code: 'AT_CAPACITY', message: 'This worker instance is at capacity' },
+      const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'hat-score-'));
+      const p: Pipeline = {
+        owner: userId,
+        stopped: false,
+        child: null,
+        task: Promise.resolve(),
+        folder,
+        scoreFile: path.join(folder, 'score.txt'),
+        output: '',
+        youtube: body.target === 'youtube',
+      };
+      try {
+        writeScore(p.scoreFile, body.scoreboard ?? defaultScoreboard);
+        if (p.youtube) {
+          const target = await youtubeControl<{
+            ingestUrl: string;
+            watchUrl: string;
+          }>('start', {
+            sessionId: id,
+            userId,
+            title: body.title ?? 'CreasePoint Live',
+            privacy: body.privacy ?? 'private',
+          });
+          p.output = target.ingestUrl;
+          p.watchUrl = target.watchUrl;
+        } else {
+          fs.mkdirSync('/output', { recursive: true });
+          p.output = `/output/${id}.ts`;
+        }
+        sessions.set(id, p);
+        p.task = runPipeline(id, p)
+          .catch(async () => {
+            p.child?.kill('SIGKILL');
+            await status(id, 'FAILED');
+            if (p.youtube) await youtubeControl('stop', { sessionId: id, userId });
+          })
+          .catch(() => {
+            logger.error({ sessionId: id }, 'Session cleanup needs retry');
+          });
+        return await reply.code(201).send({
+          sessionId: id,
+          status: 'INITIALIZING',
+          watchUrl: p.watchUrl,
         });
-        return;
+      } catch (err) {
+        await status(id, 'FAILED');
+        fs.rmSync(folder, { recursive: true, force: true });
+        if (p.youtube) {
+          await youtubeControl('stop', { sessionId: id, userId }).catch(
+            () => undefined,
+          );
+        }
+        return reply.code(503).send({
+          error: {
+            message:
+              err instanceof Error ? err.message : 'YouTube setup failed.',
+          },
+        });
       }
-
-      const config = resolveSessionConfig(request.body ?? {});
-
-      const result = await pool.query<{ id: string }>(
-        `INSERT INTO stream_sessions
-           (session_token, user_id, status, hat_ingress_rtsp_url, worker_host, live_started_at)
-         VALUES (gen_random_uuid()::text, $1, 'LIVE', $2, $3, now())
-         RETURNING id`,
-        [userId, config.rtspUrl, WORKER_HOST],
-      );
-      const { id: sessionId } = result.rows[0];
-      config.outputs = outputsForSession(sessionId);
-
-      await startSession(sessionId, userId, config, browser);
-
-      reply.status(201).send({ sessionId, status: 'LIVE' });
     },
   );
-
+  app.patch<{ Params: { id: string }; Body: Scoreboard }>(
+    '/sessions/:id/scoreboard',
+    { preHandler: requireAuth, schema: { body: scoreboardSchema } },
+    async (request, reply) => {
+      if (!(await owned(request.params.id, requestUser(request), reply))) return reply;
+      const p = sessions.get(request.params.id);
+      if (!p || p.stopped) {
+        return reply
+          .code(409)
+          .send({ error: { message: 'Broadcast is not running.' } });
+      }
+      writeScore(p.scoreFile, request.body);
+      await pool.query('UPDATE stream_sessions SET scoreboard=$2 WHERE id=$1', [
+        request.params.id,
+        request.body,
+      ]);
+      return { scoreboard: request.body };
+    },
+  );
   app.post<{ Params: { id: string } }>(
     '/sessions/:id/stop',
     { preHandler: requireAuth },
     async (request, reply) => {
-      const { userId } = request;
-      if (!userId) {
-        reply
-          .status(401)
-          .send({ error: { code: 'UNAUTHORIZED', message: 'Missing bearer token' } });
-        return;
+      const row = await owned(request.params.id, requestUser(request), reply);
+      if (!row) return reply;
+      const p = sessions.get(row.id);
+      if (p) {
+        p.stopTask ??= stopPipeline(row.id, p).catch((err: unknown) => {
+          p.stopTask = undefined;
+          throw err;
+        });
+        await p.stopTask;
+      } else {
+        const destination = await pool.query(
+          'SELECT 1 FROM youtube_broadcasts WHERE session_id=$1 AND ended_at IS NULL',
+          [row.id],
+        );
+        if (destination.rowCount) {
+          await youtubeControl('stop', {
+            sessionId: row.id,
+            userId: request.userId,
+          });
+        }
+        await pool.query(
+          "UPDATE stream_sessions SET status='TERMINATED',ended_at=now() WHERE id=$1",
+          [row.id],
+        );
       }
-
-      const row = await findOwnedSession(request.params.id, userId, reply);
-      if (!row) return;
-
-      await stopSession(row.id);
-      reply.status(200).send({ sessionId: row.id, status: 'TERMINATED' });
+      return { sessionId: row.id, status: 'TERMINATED' };
     },
   );
-
   app.get<{ Params: { id: string } }>(
     '/sessions/:id/status',
     { preHandler: requireAuth },
     async (request, reply) => {
-      const { userId } = request;
-      if (!userId) {
-        reply
-          .status(401)
-          .send({ error: { code: 'UNAUTHORIZED', message: 'Missing bearer token' } });
-        return;
-      }
-
-      const row = await findOwnedSession(request.params.id, userId, reply);
-      if (!row) return;
-
-      reply.send({ sessionId: row.id, status: row.status });
+      const row = await owned(request.params.id, requestUser(request), reply);
+      if (!row) return reply;
+      return {
+        sessionId: row.id,
+        status: row.status,
+        scoreboard: row.scoreboard,
+        watchUrl: sessions.get(row.id)?.watchUrl,
+      };
     },
   );
-
-  app.get('/sessions', { preHandler: requireAuth }, async (request, reply) => {
-    const { userId } = request;
-    if (!userId) {
-      reply.status(401).send({ error: { code: 'UNAUTHORIZED', message: 'Missing bearer token' } });
-      return;
-    }
-
-    const result = await pool.query<{ id: string; status: string }>(
-      "SELECT id, status FROM stream_sessions WHERE user_id = $1 AND status = 'LIVE'",
-      [userId],
+  app.get('/sessions', { preHandler: requireAuth }, async (request) => {
+    const result = await pool.query(
+      'SELECT id,status FROM stream_sessions WHERE user_id=$1 '
+        + "AND status IN ('INITIALIZING','LIVE','RECONNECTING')",
+      [request.userId],
     );
-    reply.send({
-      sessions: result.rows.map((row) => ({ sessionId: row.id, status: row.status })),
-    });
+    return {
+      sessions: result.rows.map((row) => ({
+        sessionId: row.id,
+        status: row.status,
+      })),
+    };
   });
-
   return app;
 }
-
 async function main(): Promise<void> {
-  const browser = await puppeteer.launch({
-    headless: true,
-    executablePath: resolveExecutablePath(),
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--use-gl=angle',
-      '--enable-accelerated-2d-canvas',
-    ],
+  // Finish abandoned YouTube broadcasts before accepting a new publisher session.
+  const abandoned = await pool.query<{ session_id: string; user_id: string }>(
+    'SELECT y.session_id,y.user_id FROM youtube_broadcasts y JOIN stream_sessions s '
+      + 'ON s.id=y.session_id WHERE s.worker_host=$1 AND y.ended_at IS NULL',
+    [HOST],
+  );
+  await Promise.all(
+    abandoned.rows.map(async (row) => youtubeControl('stop', {
+      sessionId: row.session_id,
+      userId: row.user_id,
+    })),
+  );
+  // No browser/FIFO producer: drawtext reloads the app's scoreboard atomically.
+  await pool.query(
+    "UPDATE stream_sessions SET status='FAILED' WHERE worker_host=$1 "
+      + "AND status IN ('INITIALIZING','LIVE','RECONNECTING')",
+    [HOST],
+  );
+  const app = buildApp();
+  await app.listen({ port: PORT, host: '0.0.0.0' });
+  (['SIGTERM', 'SIGINT'] as const).forEach((signal) => {
+    process.once(signal, () => {
+      Promise.allSettled(
+        [...sessions].map(async ([id, p]) => stopPipeline(id, p)),
+      )
+        .then(async () => {
+          await app.close();
+          await pool.end();
+          process.exitCode = 0;
+        })
+        .catch(() => {
+          process.exitCode = 1;
+        });
+    });
   });
-
-  const app = buildApp(browser);
-  await app.listen({ port: CONTROL_PORT, host: '0.0.0.0' });
-  app.log.info({ port: CONTROL_PORT, workerHost: WORKER_HOST }, 'control server listening');
 }
-
-// No explicit process.exit() on failure: an unhandled rejection here already
-// terminates the container with a non-zero exit code (Node's default since
-// v15), without risking a premature exit that skips in-flight cleanup.
-main().catch((err: unknown) => {
-  logger.fatal({ err }, 'worker fatal error');
-  throw err;
-});
+if (require.main === module) {
+  main().catch(() => {
+    logger.fatal(
+      'Worker startup failed. Check database migrations/configuration.',
+    );
+    process.exitCode = 1;
+  });
+}

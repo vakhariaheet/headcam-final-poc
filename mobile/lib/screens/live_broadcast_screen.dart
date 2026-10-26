@@ -1,3 +1,7 @@
+import 'package:url_launcher/url_launcher.dart';
+
+import '../widgets/scoreboard_editor.dart';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -7,8 +11,10 @@ import '../state/match_provider.dart';
 import '../state/shell_navigation_provider.dart';
 import '../theme/app_theme.dart';
 import '../widgets/destructive_button.dart';
+import '../widgets/hat_health_banner.dart';
 import '../widgets/metric_column.dart';
 import '../widgets/status_pill.dart';
+import '../widgets/telemetry_format.dart';
 
 String _signalLabel(int? rssi) {
   if (rssi == null) return '—';
@@ -37,9 +43,9 @@ class LiveBroadcastScreen extends StatelessWidget {
 /// video feed in this POC — same honest mocked-but-real-shaped treatment
 /// as the rest of the hardware layer), the battery/temperature/signal
 /// grid, an optional Score Overlay status block, End Broadcast, and
-/// Device|Settings quick links back into the shell. Battery/temperature/
-/// bitrate/fps come from the mock telemetry stream ([hatTelemetryProvider])
-/// standing in for real BLE telemetry ticks until hardware exists.
+/// Device|Settings quick links back into the shell. Bitrate/fps/Wi-Fi signal
+/// come from the hat's BLE telemetry ([hatTelemetryProvider]); the hardware
+/// cannot measure battery or temperature, so those show a dash.
 class LiveBroadcastView extends ConsumerWidget {
   const LiveBroadcastView({super.key});
 
@@ -72,7 +78,7 @@ class LiveBroadcastView extends ConsumerWidget {
     // choice).
     ref.listen(cloudStatusProvider, (_, next) {
       final status = next.valueOrNull;
-      if (status != null && !status.isLive) {
+      if (status != null && !status.isActive) {
         ref.read(broadcastSessionProvider.notifier).reportEndedUnexpectedly();
       }
     });
@@ -118,6 +124,7 @@ class LiveBroadcastView extends ConsumerWidget {
             style: Theme.of(context).textTheme.bodyMedium,
           ),
           const SizedBox(height: AppSpacing.md),
+          const HatHealthBanner(),
           telemetry.when(
             data: (t) =>
                 _CameraPreview(fps: t.fps, bitrateKbps: t.outboundBitrateKbps),
@@ -130,20 +137,20 @@ class LiveBroadcastView extends ConsumerWidget {
               children: [
                 Expanded(
                   child: MetricColumn(
-                    value: '${t.batteryLevelPct}%',
+                    value: formatBatteryLevel(t.batteryLevelPct),
                     label: 'Battery',
                   ),
                 ),
                 Expanded(
                   child: MetricColumn(
-                    value: '${t.socTemperatureC.toStringAsFixed(0)}°C',
+                    value: formatTemperature(t.socTemperatureC),
                     label: 'Temperature',
                   ),
                 ),
                 Expanded(
                   child: MetricColumn(
-                    value: _signalLabel(device?.rssi),
-                    label: 'Signal',
+                    value: _signalLabel(t.wifiRssiDbm ?? device?.rssi),
+                    label: t.wifiRssiDbm != null ? 'Wi-Fi' : 'Signal',
                   ),
                 ),
               ],
@@ -171,6 +178,19 @@ class LiveBroadcastView extends ConsumerWidget {
                 kind: StatusKind.offline,
               ),
             ),
+          ),
+          if (cloudStatus.valueOrNull?.watchUrl case final String url)
+            TextButton(
+              onPressed: () => launchUrl(
+                Uri.parse(url),
+                mode: LaunchMode.externalApplication,
+              ),
+              child: const Text('Open YouTube broadcast'),
+            ),
+          ScoreboardEditor(
+            onSave: ref
+                .read(broadcastSessionProvider.notifier)
+                .updateScoreboard,
           ),
           if (match != null) ...[
             const SizedBox(height: AppSpacing.md),

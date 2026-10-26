@@ -5,6 +5,173 @@ Entries are grouped by date rather than version number since this project
 hasn't cut a release yet. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 2026-10-22 — account linking, bounded camera restarts, OTA updates (board test pending)
+
+### Why
+
+The backend had no record of which account owns which hat. A camera failure
+latched the hat until someone pressed reset, with nothing telling the user.
+Firmware could only be updated over USB.
+
+### Added
+
+- **Hat info and account linking.** New owner-only BLE command `INFO`
+  returns the hat's Bluetooth address, model, firmware version
+  (`hat_version.h`), and camera health. After connecting, the app links the
+  hat to the signed-in account (`PUT /api/v1/devices/{serialNumber}`, plus
+  `GET`/`DELETE`), in the background so a backend outage never blocks the hat.
+  Migration `006_devices_firmware.sql` makes `devices.ble_uuid` nullable and
+  adds link and camera-health columns.
+- **Bounded camera restarts.** A camera that fails to start, produces no
+  frames, or stalls now reboots the hat, at most three times in a row
+  (`hat_camera_guard.c`, streak kept in FTL). Each fault notifies
+  `{"event":"camera_fault",...}`; after the third restart the hat stays up
+  with the fault LEDs and reports `camera: failed`. A power cycle starts a
+  fresh streak; ten healthy minutes end one. The app shows a banner on Home,
+  Devices, and Live with the attempt number, or tells the user to power-cycle.
+- **Over-the-air updates.** Sealed BLE command `UPDATE_FW` hands the hat a
+  release URL, size, and SHA-256. The hat downloads `ota.bin` over plain HTTP
+  into the inactive slot and withholds the slot's activating final block
+  until the whole image matches the hash, so a bad or interrupted download
+  never boots. Older builds are refused. Backend: `firmware_releases` table,
+  `npm run firmware:publish`, `GET /api/v1/firmware-releases`, and an
+  unauthenticated image download with an exact `Content-Length`. App: a
+  Firmware card on Devices with progress and failure messages.
+
+### Changed
+
+- Backend schema-validation errors now return 400 `VALIDATION_ERROR`
+  instead of falling through to 500.
+
+### Verified
+
+- Firmware builds with no warnings in project sources; all 10 host test
+  programs pass, including new camera-guard and OTA-image tests.
+- The real 3 MB `ota.bin`, published to a local backend and downloaded over
+  real HTTP by the firmware's own parser and writer (flash faked): verified
+  and activated with the right hash; with a wrong hash all 755 data blocks
+  were written but the activating block was not.
+- Backend lint clean; integration tests pass (devices, firmware releases,
+  existing YouTube flow) against a disposable database.
+- `flutter analyze` clean; all 90 app tests pass (20 new).
+
+### Known limitations
+
+- Nothing here has run on the board yet: INFO reply size versus the
+  negotiated MTU, the real reboot-and-recover cycle, and an actual OTA
+  install and boot into the new slot all need board tests.
+- The backend cannot verify a BLE claim, so a link request moves a hat to
+  the caller's account; production hats need a per-device factory key.
+  Linking grants no control over the hat.
+- No automatic rollback if a new build boots but misbehaves; reflash over USB.
+- Hats need `FIRMWARE_DOWNLOAD_BASE_URL` set to a plain-HTTP address they can
+  reach.
+
+## 2026-10-22 — encrypted ownership protocol (board test pending)
+
+### Why
+
+The first ownership version sent the owner key once in plaintext and Wi-Fi
+credentials and stream URLs in plaintext on every provisioning, so a nearby
+BLE sniffer could capture them. Advertising used the Bluetooth SIG test
+company ID `0xFFFF`, which is not valid for production devices.
+
+### Changed
+
+- Claim is now a P-256 ECDH key agreement: the app and hat each derive the
+  owner key with HKDF-SHA256; it is never transmitted. A claim no longer
+  authenticates the link; the app authenticates immediately after.
+- Successful authentication derives a per-connection session key. `SET_STA`
+  credentials and `START_STREAM` URLs must be sealed with AES-256-GCM under it
+  (command name bound as associated data); plaintext forms are refused.
+- Pairing flags moved from `0xFFFF` manufacturer data to 128-bit-UUID service
+  data in the scan response; no SIG company ID is needed.
+- Firmware crypto uses the SDK's mbedTLS (ECDH, GCM, HMAC); the app uses
+  `pointycastle` and `crypto`.
+
+### Known limitations
+
+- An active man-in-the-middle during the claim itself is not prevented; an
+  out-of-band confirmation code would be needed (as with BLE "Just Works").
+- Owner key and saved Wi-Fi credentials remain plaintext in flash. Protecting
+  them requires AmebaPro2 flash encryption with eFuse keys at production
+  provisioning, not application code.
+- Validation: firmware builds with no warnings in project sources; all eight
+  firmware host test programs pass under ASan/UBSan, including a new
+  secure-channel test that runs the firmware's crypto against the SDK's own
+  mbedTLS sources (RFC 5869 vector, key agreement, tamper/AAD/key-mismatch
+  rejection). The app's 70 tests pass, including vectors generated by that
+  firmware test: owner key, session key, and sealed ciphertext match
+  byte-for-byte. Not flashed.
+
+## 2026-10-22 — pairing mode, single-owner key, and onboard button (board test pending)
+
+### Why
+
+Anyone in BLE range could connect to the hat and send any command,
+including changing its Wi-Fi or starting a stream. Consumer IoT devices only
+accept a new owner while a physical button holds them in pairing mode.
+
+### Added
+
+- Pairing mode: opens at boot when unowned or on a 3 s button hold; closes
+  after 10 minutes, on a short press, or when claimed. Advertised in
+  manufacturer data (company `0xFFFF`) so the app can label hats.
+- Single owner: `CLAIM` (pairing mode only) issues a 32-byte key stored in FTL;
+  each link proves ownership with `AUTH_START`/`AUTH` HMAC-SHA256
+  challenge-response. All other commands, telemetry, and the FFE2 read value
+  require an authenticated link. Unauthenticated links are dropped after 30 s
+  outside pairing mode so they cannot block the owner.
+- Button (`PF_10`): short press closes pairing, 3–10 s opens it, ≥10 s
+  factory-resets (Wi-Fi and owner) and reboots. Gestures act on release, with
+  LED feedback while held.
+- LEDs: blue double-blink in pairing mode, plus hold feedback. Button, LED,
+  and pattern logic are split so a custom button/capacitive pad or RGB LED
+  replaces only the hardware driver.
+- App: claims hats in pairing mode and stores the key in secure storage,
+  authenticates on reconnect, and explains when a hat is not in pairing mode
+  or belongs to another phone. Scan results show each hat's pairing state.
+
+### Known limitations
+
+- BLE is unencrypted: the owner key (once, at claim) and Wi-Fi credentials
+  are exposed to a nearby sniffer during setup. The key is plaintext in flash.
+- Button polarity and LED polarity are inferred from Realtek's Arduino
+  sources, not yet observed on this board.
+- Validation: native flash image builds with no warnings in project sources;
+  all seven firmware host test programs pass under ASan/UBSan (new: button
+  gestures, pairing/owner state with real HMAC); `flutter analyze` is clean
+  and all 65 Flutter tests pass, including an HMAC vector checked against
+  OpenSSL. Not flashed.
+
+## 2026-10-22 — saved Wi-Fi, network switching, and BLE telemetry (board test pending)
+
+- Save the last network that reached DHCP to the BT library's FTL application
+  area and rejoin it at boot without the app, retrying with 15 s–2 min backoff
+  until success or an app `SET_STA`. Add `CLEAR_STA` to forget it.
+  Credentials are stored in plaintext flash.
+- Accept `SET_STA` while the camera runs as a network switch instead of
+  requiring a reset; a failed switch keeps recovering the previous network.
+- App requests preempt the hat's own Wi-Fi work instead of being rejected:
+  they take over a boot-time rejoin, and a newer request aborts association
+  in progress within 100 ms (previously up to 30 s). Requests during camera
+  bring-up run as a switch once it finishes. DHCP remains uninterruptible.
+- Notify subscribed clients every two seconds with encoder bitrate, bitrate
+  sent over RTMP, FPS, Wi-Fi RSSI, and publisher state. Send FFE2 notifications
+  only to the subscribed connection; telemetry does not replace the cached read value.
+- Drive the onboard LEDs from existing state: blue shows network (heartbeat
+  waiting, fast blink connecting, solid connected), green shows streaming
+  (fast blink connecting, solid publishing), alternating means camera fault.
+  Pattern mapping has host tests; polarity is unverified on the board.
+- App: parse telemetry into `HatTelemetry`, resubscribe when the connected hat
+  changes, show Wi-Fi signal when reported, and show a dash for battery and
+  temperature, which this hardware cannot measure.
+- Validation: native flash image builds with no warnings in project sources;
+  provisioning (including saved-network retry and app preemption) and Wi-Fi store host tests pass
+  under ASan/UBSan; sender overflow test passes; `flutter analyze` is clean and
+  all 56 Flutter tests pass. Not flashed: boot reconnect, network switching,
+  FTL persistence across power cycles, and telemetry need board tests.
+
 ## 2026-09-29 — firmware cleanup and configuration audit
 
 - Retire four obsolete Arduino prototype folders; keep `amb82_hat_native`

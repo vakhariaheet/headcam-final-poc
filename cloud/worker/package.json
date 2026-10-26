@@ -2,7 +2,7 @@
   "name": "umpirehat-compositor-worker",
   "version": "0.1.0",
   "private": true,
-  "description": "Local POC of the UmpireHat cloud compositor: renders a mock scoreboard overlay via Puppeteer and alpha-composites it onto an RTSP feed via FFmpeg.",
+  "description": "UmpireHat FFmpeg worker with app-controlled scoreboard and per-user YouTube publishing.",
   "main": "dist/server.js",
   "type": "commonjs",
   "scripts": {
@@ -16,20 +16,20 @@
     "fastify": "^5.1.0",
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.13.1",
-    "pino": "^9.0.0",
-    "puppeteer": "^23.0.0",
-    "pngjs": "^7.0.0"
+    "pino": "^9.0.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
     "@types/jsonwebtoken": "^9.0.7",
     "@types/node": "^22.10.2",
     "@types/pg": "^8.11.10",
-    "@types/pngjs": "^6.0.5",
     "eslint": "^9.39.5",
     "eslint-config-airbnb-extended": "^3.2.0",
     "pino-pretty": "^13.0.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

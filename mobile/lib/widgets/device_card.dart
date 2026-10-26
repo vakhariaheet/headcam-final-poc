@@ -3,10 +3,13 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../state/hat_connection_provider.dart';
 import '../theme/app_theme.dart';
+import 'hat_health_banner.dart';
 import 'metric_column.dart';
 import 'status_pill.dart';
+import 'telemetry_format.dart';
 
-String _signalLabel(int rssi) {
+String _signalLabel(int? rssi) {
+  if (rssi == null) return '—';
   if (rssi >= -60) return 'Excellent';
   if (rssi >= -75) return 'Good';
   return 'Weak';
@@ -77,25 +80,26 @@ class _ConnectedContent extends ConsumerWidget {
           ],
         ),
         const SizedBox(height: AppSpacing.md),
+        const HatHealthBanner(),
         telemetry.when(
           data: (t) => Row(
             children: [
               Expanded(
                 child: MetricColumn(
-                  value: '${t.batteryLevelPct}%',
+                  value: formatBatteryLevel(t.batteryLevelPct),
                   label: 'Battery',
                 ),
               ),
               Expanded(
                 child: MetricColumn(
-                  value: '${t.socTemperatureC.toStringAsFixed(0)}°C',
+                  value: formatTemperature(t.socTemperatureC),
                   label: 'Temperature',
                 ),
               ),
               Expanded(
                 child: MetricColumn(
-                  value: device != null ? _signalLabel(device.rssi) : '—',
-                  label: 'Signal',
+                  value: _signalLabel(t.wifiRssiDbm ?? device?.rssi),
+                  label: t.wifiRssiDbm != null ? 'Wi-Fi' : 'Signal',
                 ),
               ),
             ],

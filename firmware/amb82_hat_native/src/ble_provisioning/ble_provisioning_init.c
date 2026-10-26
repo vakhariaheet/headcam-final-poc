@@ -28,6 +28,8 @@
 #include <gap_bond_le.h>
 #include <gap_msg.h>
 #include <gap_config.h>
+#include <gap_conn_le.h>
+#include <os_msg.h>
 #include <profile_server.h>
 #include <bte.h>
 #include "app_task.h"
@@ -42,6 +44,8 @@
 #include "ble_provisioning_init.h"
 #include "ble_provisioning_service.h"
 #include "ble_provisioning_task.h"
+#include "hat_owner.h"
+#include "hat_pairing.h"
 
 #define DEFAULT_ADVERTISING_INTERVAL_MIN 352 // 220ms
 #define DEFAULT_ADVERTISING_INTERVAL_MAX 384 // 240ms
@@ -51,13 +55,30 @@
 #define HAT_ADV_NAME_SUFFIX_LEN 4
 #define HAT_ADV_NAME_LEN (HAT_ADV_NAME_PREFIX_LEN + HAT_ADV_NAME_SUFFIX_LEN)
 #define HAT_ADV_NAME_OFFSET 9 // index of the first name char inside hat_adv_data[]
+// Pairing flags ride in 128-bit-UUID service data in the scan response, which
+// needs no Bluetooth SIG company ID. UUID AA8AEB53-18B8-4DF7-9C9B-4C579D9A9576,
+// little-endian as transmitted.
+#define HAT_STATUS_SERVICE_UUID_LE \
+	0x76, 0x95, 0x9A, 0x9D, 0x57, 0x4C, 0x9B, 0x9C, 0xF7, 0x4D, 0xB8, 0x18, 0x53, 0xEB, 0x8A, 0xAA
+
+// IO messages the control task posts to the BT task (IO_MSG_TYPE_ADV).
+#define HAT_IO_REFRESH_ADV 1
+#define HAT_IO_DISCONNECT 2
+
+extern void *io_queue_handle;  // app_task.c
+extern void *evt_queue_handle; // app_task.c
 
 T_GAP_DEV_STATE gap_dev_state = {0, 0, 0, 0, 0};
 static T_GAP_CONN_STATE gap_conn_state = GAP_CONN_STATE_DISCONNECTED;
 
-static const uint8_t scan_rsp_data[] = {
+static uint8_t scan_rsp_data[] = {
 	0x03, GAP_ADTYPE_APPEARANCE, LO_WORD(GAP_GATT_APPEARANCE_UNKNOWN), HI_WORD(GAP_GATT_APPEARANCE_UNKNOWN),
+	0x12, 0x21, HAT_STATUS_SERVICE_UUID_LE, // AD type 0x21: service data, 128-bit UUID
+	0x00, // HAT_ADV_FLAG_* bits, set by hat_adv_apply_flags()
 };
+
+_Static_assert(sizeof(scan_rsp_data) <= 31, "legacy scan response payload limit");
+#define HAT_ADV_FLAGS_OFFSET (sizeof(scan_rsp_data) - 1)
 
 // Local name starts as a placeholder; app_handle_dev_state_evt() overwrites
 // the last 4 chars with the real BT MAC suffix once the stack is ready and
@@ -69,6 +90,22 @@ static uint8_t hat_adv_data[] = {
 	(1 + HAT_ADV_NAME_LEN), GAP_ADTYPE_LOCAL_NAME_COMPLETE,
 	'U', 'm', 'p', 'i', 'r', 'e', 'H', 'a', 't', '_', '0', '0', '0', '0',
 };
+
+static uint32_t hat_ble_now_ms(void)
+{
+	return (uint32_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+}
+
+// Runs on the BT task. Advertising restarts with these bytes after a disconnect.
+static void hat_adv_apply_flags(void)
+{
+	uint8_t flags = 0;
+	if (hat_pairing_is_open()) flags |= HAT_ADV_FLAG_PAIRING;
+	if (hat_owner_exists()) flags |= HAT_ADV_FLAG_OWNED;
+	scan_rsp_data[HAT_ADV_FLAGS_OFFSET] = flags;
+	le_adv_set_param(GAP_PARAM_ADV_DATA, sizeof(hat_adv_data), hat_adv_data);
+	le_adv_set_param(GAP_PARAM_SCAN_RSP_DATA, sizeof(scan_rsp_data), scan_rsp_data);
+}
 
 void driver_init(void)
 {
@@ -135,7 +172,7 @@ static void app_handle_dev_state_evt(T_GAP_DEV_STATE new_state, uint16_t cause)
 		char suffix[HAT_ADV_NAME_SUFFIX_LEN + 1];
 		snprintf(suffix, sizeof(suffix), "%02X%02X", bt_addr[1], bt_addr[0]);
 		memcpy(&hat_adv_data[HAT_ADV_NAME_OFFSET + HAT_ADV_NAME_PREFIX_LEN], suffix, HAT_ADV_NAME_SUFFIX_LEN);
-		le_adv_set_param(GAP_PARAM_ADV_DATA, sizeof(hat_adv_data), hat_adv_data);
+		hat_adv_apply_flags();
 
 		uint8_t device_name[GAP_DEVICE_NAME_LEN];
 		snprintf((char *)device_name, GAP_DEVICE_NAME_LEN, HAT_ADV_NAME_PREFIX "%s", suffix);
@@ -149,11 +186,14 @@ static void app_handle_dev_state_evt(T_GAP_DEV_STATE new_state, uint16_t cause)
 
 static void app_handle_conn_state_evt(uint8_t conn_id, T_GAP_CONN_STATE new_state, uint16_t disc_cause)
 {
-	(void)conn_id;
 	if (new_state == GAP_CONN_STATE_DISCONNECTED) {
+		ble_provisioning_service_on_disconnect(conn_id);
+		hat_session_disconnected(conn_id);
 		printf("\r\n[ble_provisioning] disconnected, cause 0x%x — resume advertising\r\n", disc_cause);
+		hat_adv_apply_flags();
 		le_adv_start();
 	} else if (new_state == GAP_CONN_STATE_CONNECTED) {
+		hat_session_connected(conn_id, hat_ble_now_ms());
 		printf("\r\n[ble_provisioning] connected\r\n");
 	}
 	gap_conn_state = new_state;
@@ -195,7 +235,33 @@ void app_handle_io_msg(T_IO_MSG io_msg)
 {
 	if (io_msg.type == IO_MSG_TYPE_BT_STATUS) {
 		app_handle_gap_msg(&io_msg);
+	} else if (io_msg.type == IO_MSG_TYPE_ADV && io_msg.subtype == HAT_IO_REFRESH_ADV) {
+		hat_adv_apply_flags();
+		if (gap_dev_state.gap_adv_state == GAP_ADV_STATE_ADVERTISING) le_adv_update_param();
+	} else if (io_msg.type == IO_MSG_TYPE_ADV && io_msg.subtype == HAT_IO_DISCONNECT) {
+		le_disconnect((uint8_t)io_msg.u.param);
 	}
+}
+
+static void hat_ble_post(uint16_t subtype, uint32_t param)
+{
+	if (!io_queue_handle || !evt_queue_handle) return; // stack not running yet
+	T_IO_MSG msg = { .type = IO_MSG_TYPE_ADV, .subtype = subtype };
+	msg.u.param = param;
+	uint8_t event = EVENT_IO_TO_APP;
+	if (os_msg_send(io_queue_handle, &msg, 0)) {
+		os_msg_send(evt_queue_handle, &event, 0);
+	}
+}
+
+void ble_provisioning_refresh_advertising(void)
+{
+	hat_ble_post(HAT_IO_REFRESH_ADV, 0);
+}
+
+void ble_provisioning_disconnect(uint8_t conn_id)
+{
+	hat_ble_post(HAT_IO_DISCONNECT, conn_id);
 }
 
 static void app_le_gap_init(void)
@@ -303,6 +369,9 @@ static void ble_provisioning_init_task(void *param)
 		} while (new_state.gap_init_state != GAP_INIT_STATE_STACK_READY);
 	}
 
+	// Rejoin the last successfully provisioned network without waiting for the
+	// app; BLE stays advertising so the app can still switch networks or stream.
+	ble_provisioning_request_saved_connect();
 	vTaskDelete(NULL);
 }
 

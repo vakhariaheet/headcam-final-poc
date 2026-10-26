@@ -12,6 +12,7 @@ struct hat_rtmp_client {
     hat_avc_t avc;
     uint8_t *body;
     bool started;
+    bool awaiting_idr;
     uint32_t start_timestamp;
 };
 static void quiet_log(int level, const char *format, va_list args)
@@ -61,6 +62,7 @@ void hat_rtmp_close(hat_rtmp_client *c)
     free(c->body); free(c);
 }
 bool hat_rtmp_has_video(const hat_rtmp_client *c) { return c->started; }
+void hat_rtmp_resync(hat_rtmp_client *c) { c->awaiting_idr = true; }
 bool hat_rtmp_poll(hat_rtmp_client *c)
 {
     if (!RTMP_IsConnected(c->rtmp)) return false;
@@ -99,14 +101,14 @@ bool hat_rtmp_video(hat_rtmp_client *c, const uint8_t *annexb, size_t size, uint
     bool keyframe;
     if (!hat_avc_frame(&c->avc, annexb, size, c->body, HAT_MAX_FRAME + 4096, &written, &keyframe)) return false;
     if (!written) return true;
-    if (!c->started || c->avc.changed) {
+    if (!c->started || c->avc.changed || c->awaiting_idr) {
         if (!keyframe) return true;
         uint8_t sequence[528];
         size_t length = hat_avc_sequence(&c->avc, sequence, sizeof(sequence));
         if (!length) return true;
         if (!c->started) c->start_timestamp = timestamp;
         if (!send_video(c, sequence, length, timestamp - c->start_timestamp)) return false;
-        c->started = true; c->avc.changed = false;
+        c->started = true; c->avc.changed = false; c->awaiting_idr = false;
     }
     return send_video(c, c->body, written, timestamp - c->start_timestamp);
 }

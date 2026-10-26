@@ -13,6 +13,13 @@ import 'screens/welcome_screen.dart';
 import 'screens/forgot_password_screen.dart';
 import 'theme/app_theme.dart';
 
+// Temporary hardware-test shortcut. Set SKIP_MATCH_SETUP=false to restore
+// match URL and channel selection before preflight.
+const _skipMatchSetup = bool.fromEnvironment(
+  'SKIP_MATCH_SETUP',
+  defaultValue: true,
+);
+
 /// A signed-in umpire lands on [AppShell] (Home/Live/Devices/Recordings/
 /// Settings). Pairing a hat (Discovery → Hotspot) and starting a broadcast
 /// (Match Setup → Preflight) are two separate short flows pushed on top of
@@ -40,7 +47,9 @@ class CreasePointApp extends StatelessWidget {
         '/discovery': (_) => const DeviceDiscoveryScreen(),
         '/hotspot': (_) => const HotspotProvisioningScreen(),
         '/select-hat': (_) => const SelectHatScreen(),
-        '/match-setup': (_) => const MatchSetupScreen(),
+        '/match-setup': (_) => _skipMatchSetup
+            ? const PreflightCheckScreen()
+            : const MatchSetupScreen(),
         '/preflight': (_) => const PreflightCheckScreen(),
       },
     );

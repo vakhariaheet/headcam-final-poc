@@ -7,12 +7,22 @@ services:
       # network (see db/docker-compose.yml).
       DATABASE_URL: postgres://umpirehat:umpirehat_dev@postgres:5432/umpirehat
       JWT_SECRET: umpirehat-dev-secret-change-me
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
+      YOUTUBE_TOKEN_KEY: ${YOUTUBE_TOKEN_KEY:-}
+      WORKER_API_SECRET: ${WORKER_API_SECRET:-}
       NODE_ENV: development
       # Set SMTP_HOST plus SMTP credentials for real verification delivery.
       # Development returns the code explicitly when SMTP is absent.
       PORT: "4000"
+      FIRMWARE_DIR: /app/firmware-releases
+      # http:// origin hats can reach on their Wi-Fi, e.g. http://192.168.1.20:4000
+      FIRMWARE_DOWNLOAD_BASE_URL: ${FIRMWARE_DOWNLOAD_BASE_URL:-}
     ports:
       - "4000:4000"
+    volumes:
+      - ./firmware-releases:/app/firmware-releases
     networks:
       - db_default
 

@@ -6,6 +6,55 @@ pre-flight checks, and the live broadcast console, plus a Home ·
 Live · Devices · Recordings · Settings shell around it. Built and verified
 without any hat hardware.
 
+## Temporary hardware-test flow
+
+Match setup is currently bypassed by default: Start Broadcast on Home or
+Devices opens Preflight directly, without requiring a match URL or connected
+broadcast channel. Tap Start Broadcast again on Preflight to start the hat
+publisher and cloud session. Sign-in and preflight checks still apply.
+
+Restore match setup with `--dart-define=SKIP_MATCH_SETUP=false` when running
+or building Flutter. Restart/rebuild the app after changing this flag.
+
+The phone's horizon tilt check is also temporarily paused by default and
+does not subscribe to the accelerometer or block broadcast start. Restore
+it with `--dart-define=SKIP_TILT_CHECK=false`. Other preflight checks remain.
+
+For the deployed hardware test, the broadcast provider defaults to worker
+`http://217.216.58.69:4100` and ingest
+`rtmp://217.216.58.69:1935/live/hat`. Override these with `CLOUD_BASE_URL` and
+`HAT_INGEST_URL` Dart defines. These are unencrypted test endpoints; use an
+HTTPS worker hostname for deployment. `BACKEND_BASE_URL` is separate and must
+still point to the auth backend that issues tokens accepted by this worker.
+
+## Hat account linking, camera health, and firmware updates
+
+After proving ownership over BLE, the app reads the hat's `INFO` (Bluetooth
+address, firmware version, camera health) and, when signed in, links the hat
+to the account with `PUT /api/v1/devices/{serial}` on `BACKEND_BASE_URL`. A
+backend outage or older firmware without `INFO` never blocks using the hat.
+
+Home, Devices, and Live show a banner when the hat's camera fails: it
+restarts itself up to three times in a row ("attempt n of 3"), then asks the
+user to power-cycle it. After a recovery the banner says how many restarts
+happened.
+
+Devices has a Firmware card: Check for updates asks the backend for the
+newest release; Update sends the hat the release's URL, size, and SHA-256
+(sealed) and shows download progress until the hat restarts. The hat
+downloads the image over its own Wi-Fi, so the backend needs
+`FIRMWARE_DOWNLOAD_BASE_URL` set to an address the hat can reach (see
+`backend/README.md`). Stop any broadcast first; the hat refuses updates while
+streaming.
+
+## YouTube and scoreboard
+
+Settings now connects a user’s YouTube channel through Google OAuth. Return from
+the browser and tap Refresh connection. Preflight configures title, privacy and
+an app-controlled scoreboard; the Live screen can update it during streaming.
+Credentials and the callback hostname are placeholders in the root `.env`. See
+[YouTube setup](../cloud/YOUTUBE.md) before using this flow.
+
 ## What's real vs. mocked
 
 **Real, not mocked:**
@@ -38,19 +87,13 @@ without any hat hardware.
   implementation today. Swapping in `flutter_blue_plus` against a real hat
   is a single implementation swap — nothing in `state/` or `screens/` needs
   to change.
-- Broadcast destination OAuth (`lib/state/broadcast_channels_provider.dart`,
-  `lib/screens/broadcast_channels_screen.dart`) — connecting YouTube/
-  Facebook as *destinations* is still stub buttons that flip local state.
-  Real Google/Meta OAuth needs API credentials this build doesn't have. Not
-  to be confused with the real user auth above — this only decides where
-  the stream gets simulcast to.
 - Audio VU meter and uplink speed test (Screen 5) — simulated readings.
 - Live telemetry (Screen 6) — a timer-driven fake battery/temp/bitrate feed.
 
 **Not attempted in this slice:**
 - Screen 7 (Dynamic Island / Live Activity) — needs a native iOS
   ActivityKit/WidgetKit extension, a different toolchain from the Dart app.
-- Real OAuth token flows and YouTube/Meta API calls (spec §8.3).
+- Meta/Facebook broadcast integration.
 
 ## Design system
 
@@ -117,8 +160,7 @@ just a successful compile), against the real running `backend/` service.
   across power cycles or push periodic telemetry over BLE yet (both
   flagged in that README), so `telemetryStream()` returns an empty stream
   against real hardware for now.
-- Wire up real Google/Meta OAuth (needs API credentials) in
-  `lib/state/broadcast_channels_provider.dart`.
+- Configure and validate YouTube with a real channel; see [deployment guide](../cloud/YOUTUBE.md).
 - Build the Dynamic Island / Live Activity native extension (Screen 7).
 - Replace the simulated audio/uplink readings in
   `lib/state/preflight_provider.dart` with a real mic level and bandwidth probe.

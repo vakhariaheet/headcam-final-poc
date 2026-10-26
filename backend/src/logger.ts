@@ -9,6 +9,8 @@ import { LOG_LEVEL, NODE_ENV } from './config';
 // so log output is actually queryable once this runs somewhere real.
 export const logger = pino({
   level: LOG_LEVEL,
+  serializers: { req: (req) => ({ method: req.method, url: String(req.url).split('?')[0] }) },
+  redact: ['req.headers.authorization', 'req.headers["x-worker-secret"]'],
   transport:
     NODE_ENV === 'production'
       ? undefined

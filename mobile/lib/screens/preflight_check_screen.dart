@@ -1,3 +1,6 @@
+import '../state/scoreboard_provider.dart';
+import '../widgets/scoreboard_editor.dart';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -60,17 +63,60 @@ class _PreflightCheckScreenState extends ConsumerState<PreflightCheckScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              TextFormField(
+                initialValue: ref.read(broadcastTitleProvider),
+                maxLength: 100,
+                decoration: const InputDecoration(labelText: 'Broadcast title'),
+                onChanged: (v) =>
+                    ref.read(broadcastTitleProvider.notifier).state = v.trim(),
+              ),
+              DropdownButtonFormField<String>(
+                initialValue: ref.read(broadcastTargetProvider),
+                decoration: const InputDecoration(labelText: 'Destination'),
+                items: const [
+                  DropdownMenuItem(value: 'youtube', child: Text('YouTube')),
+                  DropdownMenuItem(
+                    value: 'recording',
+                    child: Text('Server recording (test)'),
+                  ),
+                ],
+                onChanged: (v) {
+                  if (v != null) {
+                    ref.read(broadcastTargetProvider.notifier).state = v;
+                  }
+                },
+              ),
+              DropdownButtonFormField<String>(
+                initialValue: ref.read(broadcastPrivacyProvider),
+                decoration: const InputDecoration(
+                  labelText: 'YouTube visibility',
+                ),
+                items: const [
+                  DropdownMenuItem(value: 'private', child: Text('Private')),
+                  DropdownMenuItem(value: 'unlisted', child: Text('Unlisted')),
+                  DropdownMenuItem(value: 'public', child: Text('Public')),
+                ],
+                onChanged: (v) {
+                  if (v != null) {
+                    ref.read(broadcastPrivacyProvider.notifier).state = v;
+                  }
+                },
+              ),
+              const ScoreboardEditor(),
               Card(
                 child: Padding(
                   padding: const EdgeInsets.all(18),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      _CheckRow(
-                        label: 'Horizon tilt',
-                        value: '${preflight.tiltDegrees.toStringAsFixed(1)}°',
-                        ok: preflight.tiltOk,
-                      ),
+                      if (skipTiltCheck)
+                        const Text('Horizon tilt check paused')
+                      else
+                        _CheckRow(
+                          label: 'Horizon tilt',
+                          value: '${preflight.tiltDegrees.toStringAsFixed(1)}°',
+                          ok: preflight.tiltOk,
+                        ),
                       const Divider(),
                       Text(
                         'Audio level',
@@ -99,8 +145,10 @@ class _PreflightCheckScreenState extends ConsumerState<PreflightCheckScreen> {
               const SizedBox(height: AppSpacing.md),
               if (!preflight.passed)
                 const Text(
-                  'Broadcast start is blocked until tilt is under 10° and '
-                  'uplink is at least 2.0 Mbps.',
+                  skipTiltCheck
+                      ? 'Broadcast start is blocked until uplink is at least 2.0 Mbps.'
+                      : 'Broadcast start is blocked until tilt is under 10° and '
+                            'uplink is at least 2.0 Mbps.',
                   style: TextStyle(color: AppColors.error),
                 ),
               if (session.error != null)
